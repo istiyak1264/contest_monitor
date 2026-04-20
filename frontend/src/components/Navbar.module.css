@@ -1,0 +1,95 @@
+.navbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 2rem;
+  height: 70px;
+  background-color: #1e1e2f;
+  color: white;
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  position: sticky;
+  top: 0;
+  z-index: 1000;
+}
+
+.leftSection, .rightSection {
+  flex: 1;
+  display: flex;
+  align-items: center;
+}
+
+.rightSection {
+  justify-content: flex-end;
+}
+
+.navLogo {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: bold;
+  font-size: 1.2rem;
+  color: white;
+  text-decoration: none;
+}
+
+.navLinks {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 2.5rem;
+  flex: 2; /* Occupies the middle of the screen */
+}
+
+.navLinks a {
+  color: white;
+  text-decoration: none;
+  font-weight: 500;
+  transition: color 0.2s ease;
+  font-size: 1rem;
+}
+
+.navLinks a:hover {
+  color: #00d4ff;
+}
+
+.logoutBtn {
+  background: transparent;
+  border: 2px solid #00d4ff;
+  color: #00d4ff;
+  padding: 0.4rem 1.2rem;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+  transition: all 0.3s ease;
+}
+
+.logoutBtn:hover {
+  background: #00d4ff;
+  color: #1e1e2f;
+}
+
+.hamburger {
+  display: none;
+  cursor: pointer;
+  margin-left: 1rem;
+}
+
+@media (max-width: 992px) {
+  .desktopOnly { display: none; }
+  .hamburger { display: block; }
+  .navLinks {
+    position: fixed;
+    top: 70px;
+    left: -100%;
+    flex-direction: column;
+    width: 100%;
+    height: calc(100vh - 70px);
+    background-color: #1e1e2f;
+    transition: 0.4s ease;
+    justify-content: flex-start;
+    padding-top: 2rem;
+    flex: none;
+  }
+  .navLinks.active { left: 0; }
+  .navLinks a { width: 100%; text-align: center; padding: 1rem 0; border-bottom: 1px solid #2e2e4f; }
+}

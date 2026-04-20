@@ -1,0 +1,31 @@
+/* index.css */
+
+/* Reset default margin and padding for all elements */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* Set a default font for the app */
+body {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background-color: #f5f6fa; /* default background, can be overridden by pages */
+  color: #1e1e2f; /* default text color */
+}
+
+/* Remove default list styling (for menus) */
+ul, li {
+  list-style: none;
+}
+
+/* Links default style */
+a {
+  text-decoration: none;
+  color: inherit;
+}
+
+/* Smooth scroll for all pages */
+html {
+  scroll-behavior: smooth;
+}
