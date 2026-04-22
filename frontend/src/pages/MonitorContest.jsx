@@ -25,7 +25,6 @@ const MonitorContest = () => {
   const navigate    = useNavigate();
   const contestId   = new URLSearchParams(location.search).get("id");
 
-  // ── If no contest ID, show a picker ──────────────────────────────────────
   useEffect(() => {
     if (!contestId) {
       setPickerLoading(true);
@@ -37,7 +36,6 @@ const MonitorContest = () => {
     }
   }, [contestId]);
 
-  // ── Data fetchers ─────────────────────────────────────────────────────────
   const fetchTelemetry = useCallback(async () => {
     if (!contestId) return;
     try {
@@ -93,24 +91,25 @@ const MonitorContest = () => {
 
   const violationCount = teams.filter((t) => t.is_warning === true || t.is_warning === 1).length;
 
-  // ── No ID → show contest picker ───────────────────────────────────────────
+  /* ── No ID → picker ── */
   if (!contestId) {
     return (
       <div className={styles.container}>
+        <div className={styles.scanline} />
         <header className={styles.header}>
           <div className={styles.headerInfo}>
             <FaSatellite className={styles.mainIcon} />
             <div>
-              <h1>Live Contest Monitor</h1>
-              <p className={styles.subtext}>Select a contest to open its telemetry feed</p>
+              <h1 className={styles.title}>Live Contest Monitor<span className={styles.cursor}>_</span></h1>
+              <p className={styles.subtext}>// select a contest to open its telemetry feed</p>
             </div>
           </div>
         </header>
 
         {pickerLoading ? (
-          <div className={styles.loadingText}>Loading contests…</div>
+          <div className={styles.loadingText}>&gt; Loading contests...</div>
         ) : contests.length === 0 ? (
-          <div className={styles.empty} style={{ display: "flex" }}>
+          <div className={styles.empty}>
             <FaGlobe className={styles.emptyIcon} />
             <p>No contests found. Host one first from the Dashboard.</p>
           </div>
@@ -133,15 +132,17 @@ const MonitorContest = () => {
     );
   }
 
-  // ── Normal monitor view ───────────────────────────────────────────────────
+  /* ── Monitor view ── */
   return (
     <div className={styles.container}>
+      <div className={styles.scanline} />
+
       {/* Header */}
       <header className={styles.header}>
         <div className={styles.headerInfo}>
           <FaSatellite className={styles.mainIcon} />
           <div>
-            <h1>Live Contest Monitor</h1>
+            <h1 className={styles.title}>Live Contest Monitor<span className={styles.cursor}>_</span></h1>
             <p className={styles.subtext}>
               Teams:&nbsp;<span className={styles.count}>{teams.length}</span>
               &ensp;|&ensp;Violations:&nbsp;
@@ -155,7 +156,7 @@ const MonitorContest = () => {
         </div>
         <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
           <button className={styles.backBtn} onClick={() => navigate("/dashboard")}>
-            <FaArrowLeft /> Dashboard
+            <FaArrowLeft />&nbsp;Dashboard
           </button>
           <div className={styles.liveBadge}>● LIVE</div>
         </div>
@@ -164,17 +165,23 @@ const MonitorContest = () => {
       {/* Error */}
       {error && (
         <div className={styles.errorBanner}>
-          <FaWifi />&nbsp;Connection error: {error} — retrying in {POLL_INTERVAL / 1000}s…
+          <FaWifi />&nbsp;[ERR] Connection error: {error} — retrying in {POLL_INTERVAL / 1000}s…
         </div>
       )}
 
       {/* Tabs */}
       <div className={styles.tabs}>
-        <button className={tab === "monitor" ? styles.tabActive : styles.tab} onClick={() => setTab("monitor")}>
-          <FaSatellite /> Live Teams
+        <button
+          className={tab === "monitor" ? styles.tabActive : styles.tab}
+          onClick={() => setTab("monitor")}
+        >
+          <FaSatellite />&nbsp;Live Teams
         </button>
-        <button className={tab === "ai-hits" ? styles.tabActive : styles.tab} onClick={() => setTab("ai-hits")}>
-          <FaDatabase /> AI Hits Log
+        <button
+          className={tab === "ai-hits" ? styles.tabActive : styles.tab}
+          onClick={() => setTab("ai-hits")}
+        >
+          <FaDatabase />&nbsp;AI Hits Log
           {aiHits.length > 0 && <span className={styles.tabBadge}>{aiHits.length}</span>}
         </button>
       </div>
@@ -195,7 +202,7 @@ const MonitorContest = () => {
                       <FaSkull className={styles.skullIcon} />
                       <span className={styles.violationTeamName}>{v.team_name}</span>
                       <code className={styles.violationIP}>{v.ip}</code>
-                      <span className={styles.violationTime2}><FaClock /> {v.detected_at} BST</span>
+                      <span className={styles.violationTime2}><FaClock />&nbsp;{v.detected_at} BST</span>
                     </div>
                     <div className={styles.violationMembers}>
                       <FaIdBadge className={styles.membersBadgeIcon} />
@@ -213,7 +220,7 @@ const MonitorContest = () => {
 
           <div className={styles.grid}>
             {loading ? (
-              <div className={styles.loadingText}>Connecting to telemetry feed…</div>
+              <div className={styles.loadingText}>&gt; Connecting to telemetry feed…</div>
             ) : teams.length === 0 ? (
               <div className={styles.empty}>
                 <FaGlobe className={styles.emptyIcon} />
@@ -225,7 +232,10 @@ const MonitorContest = () => {
                 return (
                   <div key={team.ip || index} className={isViolation ? styles.warningCard : styles.card}>
                     <div className={styles.cardHeader}>
-                      {isViolation ? <FaSkull style={{ color: "#ff0044" }} /> : <FaUserShield style={{ color: "#00d4ff" }} />}
+                      {isViolation
+                        ? <FaSkull style={{ color: "#ff4d4d" }} />
+                        : <FaUserShield style={{ color: "#00ff41" }} />
+                      }
                       <h2>{team.name}</h2>
                       {isViolation && <span className={styles.violationBadge}>VIOLATION</span>}
                     </div>
@@ -241,7 +251,10 @@ const MonitorContest = () => {
                       <div className={styles.statRow}>
                         <span>AI Status</span>
                         <span className={isViolation ? styles.redText : styles.greenText}>
-                          {isViolation ? <><FaExclamationTriangle />&nbsp;AI DETECTED</> : <><FaCheckCircle />&nbsp;CLEAN</>}
+                          {isViolation
+                            ? <><FaExclamationTriangle />&nbsp;AI DETECTED</>
+                            : <><FaCheckCircle />&nbsp;CLEAN</>
+                          }
                         </span>
                       </div>
                     </div>
@@ -267,7 +280,7 @@ const MonitorContest = () => {
       {tab === "ai-hits" && (
         <div className={styles.aiHitsSection}>
           {aiHits.length === 0 ? (
-            <div className={styles.empty} style={{ display: "flex" }}>
+            <div className={styles.empty}>
               <FaDatabase className={styles.emptyIcon} />
               <p>No AI hits recorded yet for this contest.</p>
             </div>
@@ -288,11 +301,11 @@ const MonitorContest = () => {
                   <tr key={i} className={styles.hitRow}>
                     <td className={styles.hitIndex}>{i + 1}</td>
                     <td className={styles.hitTime}>
-                      <FaClock style={{ marginRight: 5, color: "#ff4466" }} />{hit.hit_time}
+                      <FaClock style={{ marginRight: 5, color: "#ff4d4d" }} />{hit.hit_time}
                     </td>
                     <td><code className={styles.hitIP}>{hit.ip}</code></td>
                     <td className={styles.hitTeam}>
-                      <FaFire style={{ marginRight: 5, color: "#ff0044" }} />{hit.team_name}
+                      <FaFire style={{ marginRight: 5, color: "#ff4d4d" }} />{hit.team_name}
                     </td>
                     <td>
                       <div className={styles.memberChips}>

@@ -72,14 +72,16 @@ const Dashboard = () => {
 
   return (
     <div className={styles.container}>
+      <div className={styles.scanline} />
+
       <header className={styles.header}>
         <div className={styles.titleArea}>
           <FaTerminal className={styles.mainIcon} />
           <div>
-            <h1>Upcoming Contests</h1>
-            <p>
-              Active Deployments: <span className={styles.count}>{contests.length}</span>
-              {" "}| System: <span className={styles.online}>BST (UTC+6)</span>
+            <h1 className={styles.title}>Upcoming Contests<span className={styles.cursor}>_</span></h1>
+            <p className={styles.subtext}>
+              Active Deployments:&nbsp;<span className={styles.count}>{contests.length}</span>
+              &ensp;|&ensp;System:&nbsp;<span className={styles.online}>BST (UTC+6)</span>
             </p>
           </div>
         </div>
@@ -87,7 +89,7 @@ const Dashboard = () => {
 
       <section className={styles.content}>
         {loading ? (
-          <p className={styles.loadingText}>Synchronizing Nodes...</p>
+          <p className={styles.loadingText}>&gt; Synchronizing nodes...</p>
         ) : contests.length > 0 ? (
           <div className={styles.contestGrid}>
             {contests.map((contest) => (
@@ -105,7 +107,7 @@ const Dashboard = () => {
                     </div>
 
                     <div className={styles.timerWrapper}>
-                      <p className={styles.label}>T-Minus / Status</p>
+                      <p className={styles.label}>// T-minus / status</p>
                       <div className={timeLeft[contest.id] === "LIVE" ? styles.liveBadge : styles.countdown}>
                         <FaClock />
                         <span>{timeLeft[contest.id] || "00:00:00"}</span>
@@ -118,21 +120,21 @@ const Dashboard = () => {
                         onClick={() => navigate(`/monitor-contest?id=${contest.id}`)}
                       >
                         <FaSatellite style={{ marginRight: 8 }} />
-                        Open Telemetry
+                        &gt;&nbsp;Open Telemetry
                       </button>
                     </div>
                   </>
                 ) : (
                   <div className={styles.confirmOverlay}>
                     <FaExclamationTriangle className={styles.warnIcon} />
-                    <p>Terminate Operation?</p>
+                    <p className={styles.confirmTitle}>[WARN] Terminate Operation?</p>
                     <p className={styles.deleteNote}>This removes the contest and all traffic/AI logs.</p>
                     <div className={styles.confirmActions}>
                       <button className={styles.cancelBtn} onClick={() => setDeletingId(null)}>
-                        <FaTimes /> No
+                        <FaTimes />&nbsp;Abort
                       </button>
                       <button className={styles.confirmBtn} onClick={() => confirmDelete(contest.id)}>
-                        <FaCheck /> Yes
+                        <FaCheck />&nbsp;Confirm
                       </button>
                     </div>
                   </div>
@@ -142,6 +144,7 @@ const Dashboard = () => {
           </div>
         ) : (
           <div className={styles.emptyState}>
+            <span className={styles.emptyIcon}>{'>'}</span>
             <p>No operations detected. Initialize a contest to begin.</p>
           </div>
         )}
