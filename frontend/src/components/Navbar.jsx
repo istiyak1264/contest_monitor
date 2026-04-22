@@ -4,13 +4,13 @@ import { Link, useNavigate, useLocation } from "react-router-dom";
 import styles from "./Navbar.module.css";
 
 const Navbar = () => {
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [menuOpen,  setMenuOpen]  = useState(false);
   const [isLoggedIn, setIsLoggedIn] = useState(!!localStorage.getItem("token"));
-  const [scrolled, setScrolled] = useState(false);
+  const [scrolled,  setScrolled]  = useState(false);
   const [glitching, setGlitching] = useState(false);
   const glitchTimer = useRef(null);
-  const navigate = useNavigate();
-  const location = useLocation();
+  const navigate  = useNavigate();
+  const location  = useLocation();
 
   /* ── Auth check ── */
   useEffect(() => {
@@ -49,8 +49,8 @@ const Navbar = () => {
     return () => { document.body.style.overflow = ""; };
   }, [menuOpen]);
 
-  const toggleMenu = () => setMenuOpen((v) => !v);
-  const closeMenu = () => setMenuOpen(false);
+  const toggleMenu  = ()  => setMenuOpen((v) => !v);
+  const closeMenu   = ()  => setMenuOpen(false);
 
   const handleLogout = () => {
     localStorage.removeItem("token");
@@ -66,7 +66,7 @@ const Navbar = () => {
       role="navigation"
       aria-label="Main navigation"
     >
-      {/* Animated scanning top border */}
+      {/* Scanning top border */}
       <span className={styles.topBorder} aria-hidden="true" />
 
       {/* ── LEFT: Logo ── */}
@@ -96,15 +96,15 @@ const Navbar = () => {
       >
         {!isLoggedIn ? (
           <>
-            <NavLink to="/login" onClick={closeMenu} index={0}>Login</NavLink>
-            <NavLink to="/about" onClick={closeMenu} index={1}>About</NavLink>
+            <NavLink to="/login"    onClick={closeMenu} index={0}>Login</NavLink>
+            <NavLink to="/about"    onClick={closeMenu} index={1}>About</NavLink>
             <NavLink to="/register" onClick={closeMenu} index={2}>Get Started</NavLink>
           </>
         ) : (
           <>
-            <NavLink to="/dashboard" onClick={closeMenu} index={0}>Dashboard</NavLink>
+            <NavLink to="/dashboard"       onClick={closeMenu} index={0}>Dashboard</NavLink>
             <NavLink to="/monitor-contest" onClick={closeMenu} index={1}>Monitor Contest</NavLink>
-            <NavLink to="/host-contest" onClick={closeMenu} index={2}>Host Contest</NavLink>
+            <NavLink to="/host-contest"    onClick={closeMenu} index={2}>Host Contest</NavLink>
           </>
         )}
       </div>
@@ -127,7 +127,7 @@ const Navbar = () => {
           aria-label={menuOpen ? "Close menu" : "Open menu"}
           aria-expanded={menuOpen}
         >
-          {menuOpen ? <FaTimes size={20} /> : <FaBars size={20} />}
+          {menuOpen ? <FaTimes size={18} /> : <FaBars size={18} />}
         </button>
       </div>
 
