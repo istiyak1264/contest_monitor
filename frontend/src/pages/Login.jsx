@@ -1,12 +1,26 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import styles from "./Login.module.css";
 
+const SUBTITLE_TEXT = "// secure access portal";
+
 const Login = () => {
   const navigate = useNavigate();
-  const [email, setEmail] = useState("");
+  const [email, setEmail]       = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
+  const [error, setError]       = useState("");
+  const [typed, setTyped]       = useState("");
+
+  /* Typing animation for subtitle */
+  useEffect(() => {
+    let i = 0;
+    const interval = setInterval(() => {
+      setTyped(SUBTITLE_TEXT.slice(0, i + 1));
+      i++;
+      if (i >= SUBTITLE_TEXT.length) clearInterval(interval);
+    }, 55);
+    return () => clearInterval(interval);
+  }, []);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -34,26 +48,48 @@ const Login = () => {
 
   return (
     <div className={styles.container}>
+      <div className={styles.scanline} />
+
       <form className={styles.form} onSubmit={handleSubmit}>
-        <h2>Login</h2>
-        {error && <p style={{color: 'red', textAlign: 'center'}}>{error}</p>}
-        <input
-          className={styles.input}
-          type="email"
-          placeholder="Email"
-          required
-          onChange={(e) => setEmail(e.target.value)}
-        />
-        <input
-          className={styles.input}
-          type="password"
-          placeholder="Password"
-          required
-          onChange={(e) => setPassword(e.target.value)}
-        />
-        <button type="submit">Login</button>
+        <h2 className={styles.title}>User Login</h2>
+
+        {error && <p key={error} className={styles.error}>{error}</p>}
+
+        <div className={styles.inputWrapper}>
+          <label className={styles.label}>Email Address</label>
+          <span className={styles.inputIcon}>@</span>
+          <input
+            className={styles.input}
+            type="email"
+            placeholder="example@mail.com"
+            required
+            onChange={(e) => setEmail(e.target.value)}
+          />
+        </div>
+
+        <div className={styles.inputWrapper}>
+          <label className={styles.label}>Password</label>
+          <span className={styles.inputIcon}>#</span>
+          <input
+            className={styles.input}
+            type="password"
+            placeholder="••••••••••••"
+            required
+            onChange={(e) => setPassword(e.target.value)}
+          />
+        </div>
+
+        <button className={styles.button} type="submit">
+          &gt;&nbsp;Authenticate
+        </button>
+
+        <div className={styles.divider}>
+          <span>no account yet?</span>
+        </div>
+
         <p className={styles.registerText}>
-          Don’t have an account? <Link to="/register" className={styles.registerLink}>Register</Link>
+          Don't have an account?{" "}
+          <Link to="/register" className={styles.registerLink}>Register</Link>
         </p>
       </form>
     </div>
