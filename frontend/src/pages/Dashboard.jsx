@@ -12,6 +12,8 @@ import {
 } from "react-icons/fa";
 import styles from "./Dashboard.module.css";
 
+const API = import.meta.env.VITE_API_URL;
+
 const Dashboard = () => {
   const [contests, setContests]     = useState([]);
   const [loading, setLoading]       = useState(true);
@@ -22,7 +24,7 @@ const Dashboard = () => {
 
   const fetchContests = useCallback(async () => {
     try {
-      const response = await fetch("http://localhost:8080/contests");
+      const response = await fetch(`${API}/contests`);
       if (response.ok) {
         const data = await response.json();
         setContests(data);
@@ -38,7 +40,7 @@ const Dashboard = () => {
 
   const confirmDelete = async (id) => {
     try {
-      const response = await fetch(`http://localhost:8080/contests/${id}`, { method: "DELETE" });
+      const response = await fetch(`${API}/contests/${id}`, { method: "DELETE" });
       if (response.ok) {
         setContests((prev) => prev.filter((c) => c.id !== id));
         setDeletingId(null);

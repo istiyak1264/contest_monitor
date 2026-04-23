@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import styles from "./Register.module.css";
 
+const API           = import.meta.env.VITE_API_URL;
 const SUBTITLE_TEXT = "// create secure account";
 
 const Register = () => {
@@ -36,7 +37,7 @@ const Register = () => {
     }
 
     try {
-      const response = await fetch("http://127.0.0.1:8080/register", {
+      const response = await fetch(`${API}/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

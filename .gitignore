@@ -1,0 +1,13 @@
+# Environment
+.env
+*.env
+
+# Node
+node_modules/
+dist/
+
+# Go
+backend/main
+
+# Docker volumes
+mysql_data/

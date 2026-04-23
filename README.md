@@ -1,1 +1,1 @@
-It is built for detecting AI in the offline competetive programming.
+It is build for detecting usage of AI in competetive programming.

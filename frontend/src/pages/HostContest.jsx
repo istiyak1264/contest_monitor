@@ -5,6 +5,8 @@ import {
 } from "react-icons/fa";
 import styles from "./HostContest.module.css";
 
+const API = import.meta.env.VITE_API_URL;
+
 const HostContest = () => {
   const [formData, setFormData] = useState({
     contestName: "",
@@ -38,7 +40,7 @@ const HostContest = () => {
     data.append("file", formData.csvFile);
 
     try {
-      const res = await fetch("http://localhost:8080/host-contest", { method: "POST", body: data });
+      const res = await fetch(`${API}/host-contest`, { method: "POST", body: data });
       if (res.ok) {
         setStatus({ loading: false, message: "Contest Deployed Successfully.", type: "success" });
         setFormData({ contestName: "", contestTime: "", duration: "120", csvFile: null });

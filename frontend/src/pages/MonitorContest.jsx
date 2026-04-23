@@ -7,6 +7,7 @@ import {
 } from "react-icons/fa";
 import styles from "./MonitorContest.module.css";
 
+const API           = import.meta.env.VITE_API_URL;
 const POLL_INTERVAL = 3000;
 
 const MonitorContest = () => {
@@ -28,7 +29,7 @@ const MonitorContest = () => {
   useEffect(() => {
     if (!contestId) {
       setPickerLoading(true);
-      fetch("http://localhost:8080/contests")
+      fetch(`${API}/contests`)
         .then((r) => r.json())
         .then((data) => setContests(Array.isArray(data) ? data : []))
         .catch(() => setContests([]))
@@ -39,7 +40,7 @@ const MonitorContest = () => {
   const fetchTelemetry = useCallback(async () => {
     if (!contestId) return;
     try {
-      const res = await fetch(`http://localhost:8080/contests/${contestId}/monitor`, { cache: "no-store" });
+      const res = await fetch(`${API}/contests/${contestId}/monitor`, { cache: "no-store" });
       if (!res.ok) throw new Error(`Server returned ${res.status}`);
       const raw = await res.json();
       setTeams(Array.isArray(raw) ? raw : []);
@@ -54,7 +55,7 @@ const MonitorContest = () => {
   const fetchViolations = useCallback(async () => {
     if (!contestId) return;
     try {
-      const res = await fetch(`http://localhost:8080/contests/${contestId}/violations`, { cache: "no-store" });
+      const res = await fetch(`${API}/contests/${contestId}/violations`, { cache: "no-store" });
       if (!res.ok) return;
       const raw = await res.json();
       setViolations(Array.isArray(raw) ? raw : []);
@@ -65,7 +66,7 @@ const MonitorContest = () => {
   const fetchAIHits = useCallback(async () => {
     if (!contestId) return;
     try {
-      const res = await fetch(`http://localhost:8080/contests/${contestId}/ai-hits`, { cache: "no-store" });
+      const res = await fetch(`${API}/contests/${contestId}/ai-hits`, { cache: "no-store" });
       if (!res.ok) return;
       const raw = await res.json();
       setAiHits(Array.isArray(raw) ? raw : []);
