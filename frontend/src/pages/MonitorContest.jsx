@@ -7,6 +7,7 @@ import {
 } from "react-icons/fa";
 import styles from "./MonitorContest.module.css";
 
+
 const API           = import.meta.env.VITE_API_URL;
 const POLL_INTERVAL = 3000;
 
@@ -21,10 +22,25 @@ const MonitorContest = () => {
   const [contests, setContests]     = useState([]);
   const [pickerLoading, setPickerLoading] = useState(false);
 
-  const intervalRef = useRef(null);
-  const location    = useLocation();
-  const navigate    = useNavigate();
-  const contestId   = new URLSearchParams(location.search).get("id");
+  const intervalRef    = useRef(null);
+  const prevViolations = useRef(0);
+  const prevAiHits     = useRef(0);
+  const audioRef       = useRef(null);
+
+  const location  = useLocation();
+  const navigate  = useNavigate();
+  const contestId = new URLSearchParams(location.search).get("id");
+
+  useEffect(() => {
+    audioRef.current = new Audio("/notification.mp3");
+    audioRef.current.volume = 1.0;
+  }, []);
+
+  const playAlert = useCallback(() => {
+    if (!audioRef.current) return;
+    audioRef.current.currentTime = 0;
+    audioRef.current.play().catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (!contestId) {
@@ -58,10 +74,18 @@ const MonitorContest = () => {
       const res = await fetch(`${API}/contests/${contestId}/violations`, { cache: "no-store" });
       if (!res.ok) return;
       const raw = await res.json();
-      setViolations(Array.isArray(raw) ? raw : []);
+      const data = Array.isArray(raw) ? raw : [];
+
+      // Play sound if new violations appeared
+      if (data.length > prevViolations.current) {
+        playAlert();
+      }
+      prevViolations.current = data.length;
+
+      setViolations(data);
       setLastSync(new Date());
     } catch (_) {}
-  }, [contestId]);
+  }, [contestId, playAlert]);
 
   const fetchAIHits = useCallback(async () => {
     if (!contestId) return;
@@ -69,9 +93,17 @@ const MonitorContest = () => {
       const res = await fetch(`${API}/contests/${contestId}/ai-hits`, { cache: "no-store" });
       if (!res.ok) return;
       const raw = await res.json();
-      setAiHits(Array.isArray(raw) ? raw : []);
+      const data = Array.isArray(raw) ? raw : [];
+
+      // Play sound if new AI hits appeared
+      if (data.length > prevAiHits.current) {
+        playAlert();
+      }
+      prevAiHits.current = data.length;
+
+      setAiHits(data);
     } catch (_) {}
-  }, [contestId]);
+  }, [contestId, playAlert]);
 
   useEffect(() => {
     if (!contestId) return;
