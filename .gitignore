@@ -11,6 +11,3 @@ backend/main
 
 # Docker volumes
 mysql_data/
-
-#docker-compose
-docker-compose.yml

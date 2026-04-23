@@ -3,15 +3,15 @@ services:
     image: mysql:8.0
     restart: always
     environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASS:-1712750452}
-      MYSQL_DATABASE: ${DB_NAME:-auth_db}
+      MYSQL_ROOT_PASSWORD: ${DB_PASS}
+      MYSQL_DATABASE: ${DB_NAME}
     volumes:
       - mysql_data:/var/lib/mysql
       - ./mysql/init:/docker-entrypoint-initdb.d
     ports:
       - "3307:3306"
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${DB_PASS:-1712750452}"]
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -p$DB_PASS"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -22,9 +22,9 @@ services:
     network_mode: host
     environment:
       DB_HOST: 127.0.0.1
-      DB_USER: ${DB_USER:-root}
-      DB_PASS: ${DB_PASS:-1712750452}
-      DB_NAME: ${DB_NAME:-auth_db}
+      DB_USER: ${DB_USER}
+      DB_PASS: ${DB_PASS}
+      DB_NAME: ${DB_NAME}
     depends_on:
       db:
         condition: service_healthy
