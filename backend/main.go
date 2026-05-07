@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/binary"
 	"encoding/csv"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,7 +24,26 @@ import (
 	"gorm.io/gorm"
 )
 
-// ── Models ───────────────────────────────────────────────────────────────────
+// ── Timezone ──────────────────────────────────────────────────────────────────
+
+// BST is Bangladesh Standard Time (UTC+6). All user-facing timestamps are
+// stored and displayed in this zone.
+var bst = func() *time.Location {
+	loc, err := time.LoadLocation("Asia/Dhaka")
+	if err != nil {
+		// Fallback: fixed offset UTC+6 (same as Asia/Dhaka, no DST)
+		loc = time.FixedZone("BST", 6*3600)
+	}
+	return loc
+}()
+
+// nowBST returns the current time in BST.
+func nowBST() time.Time { return time.Now().In(bst) }
+
+// fmtBST formats a time as HH:MM:SS in BST.
+func fmtBST(t time.Time) string { return t.In(bst).Format("15:04:05") }
+
+// ── Models ────────────────────────────────────────────────────────────────────
 
 type User struct {
 	ID       uint   `json:"id"    gorm:"primaryKey"`
@@ -40,7 +62,6 @@ type Contest struct {
 	AIHitsTable      string    `json:"ai_hits_table"`
 }
 
-// TeamStatus is returned by the monitor endpoint.
 type TeamStatus struct {
 	Name      string `json:"name"`
 	Members   string `json:"members"`
@@ -50,7 +71,6 @@ type TeamStatus struct {
 	LastSeen  string `json:"last_seen"`
 }
 
-// ViolationTeam is returned by the violations endpoint.
 type ViolationTeam struct {
 	TeamName   string   `json:"team_name"`
 	Members    []string `json:"members"`
@@ -59,7 +79,6 @@ type ViolationTeam struct {
 	Domain     string   `json:"domain"`
 }
 
-// AIHitDetail is returned by the ai-hits endpoint.
 type AIHitDetail struct {
 	IP       string   `json:"ip"`
 	TeamName string   `json:"team_name"`
@@ -73,11 +92,14 @@ type AIHitDetail struct {
 var (
 	db        *gorm.DB
 	sqlDB     *sql.DB
-	jwtSecret = []byte(getEnv("JWT_SECRET", "kali-linux-super-secret-key"))
+	jwtSecret = []byte(getEnv("JWT_SECRET", "change-this-to-a-long-random-secret-key"))
 	aiDomains = []string{
 		"chatgpt", "openai", "gemini", "grok", "claude", "anthropic",
 		"perplexity", "deepseek", "manus", "stackoverflow", "geeksforgeeks",
 	}
+
+	snifferCancels   = make(map[uint]context.CancelFunc)
+	snifferCancelsMu sync.Mutex
 )
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -112,12 +134,55 @@ func containsAIDomain(s string) string {
 	return ""
 }
 
+// splitMembers splits a comma-separated member string into a trimmed slice.
+func splitMembers(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// ── JWT Middleware ────────────────────────────────────────────────────────────
+
+func authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := c.GetHeader("Authorization")
+		if !strings.HasPrefix(authHeader, "Bearer ") {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "authorization header required"})
+			return
+		}
+		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+		token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+			}
+			return jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
+			return
+		}
+		claims, ok := token.Claims.(jwt.MapClaims)
+		if !ok {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token claims"})
+			return
+		}
+		c.Set("user_id", claims["user_id"])
+		c.Next()
+	}
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 func main() {
 	probeInterfaces()
 
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:3306)/%s?charset=utf8mb4&parseTime=True&loc=Local",
+	// Use UTC for MySQL storage; all BST conversion happens in Go.
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:3306)/%s?charset=utf8mb4&parseTime=True&loc=UTC",
 		getEnv("DB_USER", "root"),
 		getEnv("DB_PASS", ""),
 		getEnv("DB_HOST", "127.0.0.1"),
@@ -129,15 +194,20 @@ func main() {
 	if err != nil {
 		log.Fatalf("[DB] connect error: %v", err)
 	}
-
 	sqlDB, err = db.DB()
 	if err != nil {
 		log.Fatalf("[DB] get underlying sql.DB error: %v", err)
 	}
+	// Connection pool tuning.
+	sqlDB.SetMaxOpenConns(25)
+	sqlDB.SetMaxIdleConns(10)
+	sqlDB.SetConnMaxLifetime(5 * time.Minute)
 
 	if err = db.AutoMigrate(&User{}, &Contest{}); err != nil {
 		log.Fatalf("[DB] auto-migrate error: %v", err)
 	}
+
+	resumeActiveSniffers()
 
 	gin.SetMode(getEnv("GIN_MODE", "release"))
 	r := gin.New()
@@ -155,42 +225,49 @@ func main() {
 		c.Next()
 	})
 
-	// Auth
 	r.POST("/login", login)
 	r.POST("/register", register)
 
-	// Contests
-	r.POST("/host-contest", hostContest)
-	r.GET("/contests", getContests)
-	r.DELETE("/contests/:id", deleteContest)
-
-	// Monitor
-	r.GET("/contests/:id/monitor", monitorTelemetry)
-	r.GET("/contests/:id/violations", getViolations)
-	r.GET("/contests/:id/ai-hits", getAIHits)
+	auth := r.Group("/", authMiddleware())
+	{
+		auth.POST("/host-contest", hostContest)
+		auth.GET("/contests", getContests)
+		auth.DELETE("/contests/:id", deleteContest)
+		auth.GET("/contests/:id/monitor", monitorTelemetry)
+		auth.GET("/contests/:id/violations", getViolations)
+		auth.GET("/contests/:id/ai-hits", getAIHits)
+	}
 
 	if err := r.Run(":8080"); err != nil {
 		log.Fatalf("[GIN] server error: %v", err)
 	}
 }
 
+// resumeActiveSniffers restarts packet capture for contests still active after restart.
+func resumeActiveSniffers() {
+	var contests []Contest
+	if err := db.Find(&contests).Error; err != nil {
+		log.Printf("[RESUME] could not load contests: %v", err)
+		return
+	}
+	now := time.Now().UTC()
+	for _, c := range contests {
+		if now.Before(c.EndTime) {
+			log.Printf("[RESUME] restarting sniffer for contest %d (%s)", c.ID, c.Name)
+			startSniffer(c)
+		}
+	}
+}
+
 // ── Interface probing ─────────────────────────────────────────────────────────
 
-type probeResult struct {
-	name   string
-	ips    []string
-	usable bool
-	reason string // populated when usable == false
-}
-func probeInterfaces() []string {
+func probeInterfaces() {
 	log.Println("[IFACE] ── Probing network interfaces ──────────────────────")
-
 	devs, err := pcap.FindAllDevs()
 	if err != nil {
 		log.Printf("[IFACE] FindAllDevs error: %v", err)
-		return nil
+		return
 	}
-
 	var usable []string
 	for _, dev := range devs {
 		r := evaluateInterface(dev)
@@ -201,51 +278,46 @@ func probeInterfaces() []string {
 			log.Printf("[IFACE] ✗  %-15s  skip: %s", r.name, r.reason)
 		}
 	}
-
 	if len(usable) == 0 {
 		log.Println("[IFACE] WARNING: no usable interfaces found — sniffing will not work")
 	} else {
-		log.Printf("[IFACE] Ready to sniff %d interface(s): %s",
-			len(usable), strings.Join(usable, ", "))
+		log.Printf("[IFACE] Ready to sniff %d interface(s): %s", len(usable), strings.Join(usable, ", "))
 	}
 	log.Println("[IFACE] ────────────────────────────────────────────────────")
-	return usable
+}
+
+type probeResult struct {
+	name   string
+	ips    []string
+	usable bool
+	reason string
 }
 
 func evaluateInterface(dev pcap.Interface) probeResult {
 	r := probeResult{name: dev.Name}
-
-	// 1. Skip the "any" pseudo-device.
 	if dev.Name == "any" {
-		r.reason = "pseudo-device (skipped to ensure real LAN traffic is captured)"
+		r.reason = "pseudo-device"
 		return r
 	}
-
-	// 2. Skip loopback — checked by name prefix and pcap flag (FlagLoopback = 1).
 	if dev.Name == "lo" || strings.HasPrefix(dev.Name, "lo:") || dev.Flags&0x1 != 0 {
 		r.reason = "loopback"
 		return r
 	}
-
-	// 3. Must have at least one assigned IP address.
 	for _, addr := range dev.Addresses {
 		if ip := addr.IP.String(); ip != "" && ip != "<nil>" {
 			r.ips = append(r.ips, ip)
 		}
 	}
 	if len(r.ips) == 0 {
-		r.reason = "no IP address assigned (interface may be down)"
+		r.reason = "no IP address assigned"
 		return r
 	}
-
-	// 4. Try opening with pcap to confirm permissions and driver support.
 	handle, err := pcap.OpenLive(dev.Name, 65535, true, pcap.BlockForever)
 	if err != nil {
 		r.reason = fmt.Sprintf("pcap open failed: %v", err)
 		return r
 	}
 	handle.Close()
-
 	r.usable = true
 	return r
 }
@@ -264,19 +336,14 @@ func getSniffInterfaces() []string {
 				continue
 			}
 			h.Close()
-			log.Printf("[IFACE] SNIFF_IFACE override accepted: %s", name)
 			result = append(result, name)
 		}
 		if len(result) > 0 {
 			return result
 		}
-		log.Println("[IFACE] SNIFF_IFACE produced no usable interfaces — falling back to auto-detect")
 	}
-
-	// Auto-detect all usable interfaces.
 	devs, err := pcap.FindAllDevs()
 	if err != nil {
-		log.Printf("[IFACE] FindAllDevs error: %v", err)
 		return nil
 	}
 	var result []string
@@ -291,40 +358,37 @@ func getSniffInterfaces() []string {
 // ── Table helpers ─────────────────────────────────────────────────────────────
 
 func createParticipantsTable(name string) error {
-	q := fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS `+"`%s`"+` (
-			id           INT AUTO_INCREMENT PRIMARY KEY,
-			team_name    TEXT,
-			ip           TEXT,
-			members      TEXT,
-			ai_violation TINYINT(1) DEFAULT 0,
-			last_seen    DATETIME
-		)`, name)
+	q := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS `+"`%s`"+` (
+		id           INT AUTO_INCREMENT PRIMARY KEY,
+		team_name    TEXT,
+		ip           TEXT,
+		members      TEXT,
+		ai_violation TINYINT(1) DEFAULT 0,
+		last_seen    DATETIME
+	)`, name)
 	_, err := sqlDB.Exec(q)
 	return err
 }
 
 func createTrafficLogsTable(name string) error {
-	q := fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS `+"`%s`"+` (
-			id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-			ip         TEXT,
-			ai_service TEXT,
-			timestamp  DATETIME(3)
-		)`, name)
+	q := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS `+"`%s`"+` (
+		id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		ip         TEXT,
+		ai_service TEXT,
+		timestamp  DATETIME(3)
+	)`, name)
 	_, err := sqlDB.Exec(q)
 	return err
 }
 
 func createAIHitsTable(name string) error {
-	q := fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS `+"`%s`"+` (
-			id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-			contest_id BIGINT UNSIGNED,
-			ip         TEXT,
-			domain     TEXT,
-			created_at DATETIME(3)
-		)`, name)
+	q := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS `+"`%s`"+` (
+		id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		contest_id BIGINT UNSIGNED,
+		ip         TEXT,
+		domain     TEXT,
+		created_at DATETIME(3)
+	)`, name)
 	_, err := sqlDB.Exec(q)
 	return err
 }
@@ -335,41 +399,31 @@ func extractSNI(payload []byte) string {
 	if len(payload) < 6 || payload[0] != 0x16 || payload[5] != 0x01 {
 		return ""
 	}
-
 	pos := 43
 	if pos >= len(payload) {
 		return ""
 	}
-
-	// Session ID
 	sessionIDLen := int(payload[pos])
 	pos += 1 + sessionIDLen
 	if pos+2 > len(payload) {
 		return ""
 	}
-
-	// Cipher suites
 	cipherSuitesLen := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
 	pos += 2 + cipherSuitesLen
 	if pos+1 > len(payload) {
 		return ""
 	}
-
-	// Compression methods
 	compressionLen := int(payload[pos])
 	pos += 1 + compressionLen
 	if pos+2 > len(payload) {
 		return ""
 	}
-
-	// Extensions block
 	extensionsLen := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
 	pos += 2
 	end := pos + extensionsLen
 	if end > len(payload) {
 		end = len(payload)
 	}
-
 	for pos+4 <= end {
 		extType := binary.BigEndian.Uint16(payload[pos : pos+2])
 		extLen := int(binary.BigEndian.Uint16(payload[pos+2 : pos+4]))
@@ -395,10 +449,10 @@ func extractDNSHostnames(payload []byte) []string {
 		return nil
 	}
 	dns, _ := dnsLayer.(*layers.DNS)
-	if dns.QR { // QR=1 → response
+	if dns.QR {
 		return nil
 	}
-	var names []string
+	names := make([]string, 0, len(dns.Questions))
 	for _, q := range dns.Questions {
 		if name := strings.TrimSpace(string(q.Name)); name != "" {
 			names = append(names, name)
@@ -408,21 +462,48 @@ func extractDNSHostnames(payload []byte) []string {
 }
 
 // ── Sniffer ───────────────────────────────────────────────────────────────────
+
 func startSniffer(contest Contest) {
 	ifaces := getSniffInterfaces()
 	if len(ifaces) == 0 {
-		log.Printf("[SNIFFER] contest %d: no usable interfaces found — sniffing disabled", contest.ID)
+		log.Printf("[SNIFFER] contest %d: no usable interfaces — sniffing disabled", contest.ID)
 		return
 	}
-	log.Printf("[SNIFFER] contest %d: starting on interface(s): %s",
-		contest.ID, strings.Join(ifaces, ", "))
+
+	ctx, cancel := context.WithDeadline(context.Background(), contest.EndTime)
+
+	snifferCancelsMu.Lock()
+	if existing, ok := snifferCancels[contest.ID]; ok {
+		existing()
+	}
+	snifferCancels[contest.ID] = cancel
+	snifferCancelsMu.Unlock()
+
+	log.Printf("[SNIFFER] contest %d: starting on %s", contest.ID, strings.Join(ifaces, ", "))
 	for _, iface := range ifaces {
-		go sniffInterface(iface, contest)
+		go sniffInterface(ctx, iface, contest)
+	}
+
+	go func() {
+		<-ctx.Done()
+		snifferCancelsMu.Lock()
+		delete(snifferCancels, contest.ID)
+		snifferCancelsMu.Unlock()
+		log.Printf("[SNIFFER] contest %d: all sniffers stopped", contest.ID)
+	}()
+}
+
+func stopSniffer(contestID uint) {
+	snifferCancelsMu.Lock()
+	defer snifferCancelsMu.Unlock()
+	if cancel, ok := snifferCancels[contestID]; ok {
+		cancel()
+		delete(snifferCancels, contestID)
 	}
 }
 
-func sniffInterface(iface string, contest Contest) {
-	handle, err := pcap.OpenLive(iface, 65535, true, pcap.BlockForever)
+func sniffInterface(ctx context.Context, iface string, contest Contest) {
+	handle, err := pcap.OpenLive(iface, 65535, true, 500*time.Millisecond)
 	if err != nil {
 		log.Printf("[SNIFFER] [%s] open error: %v", iface, err)
 		return
@@ -435,36 +516,37 @@ func sniffInterface(iface string, contest Contest) {
 		return
 	}
 
-	log.Printf("[SNIFFER] [%s] listening — contest %d  (%s → %s)",
+	log.Printf("[SNIFFER] [%s] listening — contest %d (%s → %s BST)",
 		iface, contest.ID,
-		contest.StartTime.Format("15:04:05"),
-		contest.EndTime.Format("15:04:05"),
+		fmtBST(contest.StartTime),
+		fmtBST(contest.EndTime),
 	)
 
 	src := gopacket.NewPacketSource(handle, handle.LinkType())
 	src.DecodeOptions.Lazy = true
 	src.DecodeOptions.NoCopy = true
 
-	for pkt := range src.Packets() {
-		now := time.Now()
-		if now.After(contest.EndTime) {
-			log.Printf("[SNIFFER] [%s] contest %d ended — stopping", iface, contest.ID)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[SNIFFER] [%s] contest %d: context cancelled — stopping", iface, contest.ID)
 			return
-		}
-		if now.Before(contest.StartTime) {
-			continue
-		}
+		case pkt, ok := <-src.Packets():
+			if !ok {
+				return
+			}
+			if time.Now().UTC().Before(contest.StartTime) {
+				continue
+			}
 
-		netLayer := pkt.NetworkLayer()
-		if netLayer == nil {
-			continue
-		}
-		srcIP := normalizeIP(netLayer.NetworkFlow().Src().String())
+			netLayer := pkt.NetworkLayer()
+			if netLayer == nil {
+				continue
+			}
+			srcIP := normalizeIP(netLayer.NetworkFlow().Src().String())
+			detected := ""
 
-		detected := ""
-
-		// Layer 1 — DNS query (UDP 53).
-		if detected == "" {
+			// DNS query
 			if udpLayer := pkt.Layer(layers.LayerTypeUDP); udpLayer != nil {
 				udp, _ := udpLayer.(*layers.UDP)
 				for _, name := range extractDNSHostnames(udp.Payload) {
@@ -474,58 +556,53 @@ func sniffInterface(iface string, contest Contest) {
 					}
 				}
 			}
-		}
 
-		// Layer 2 — TLS SNI (TCP 443).
-		if detected == "" {
-			if tcpLayer := pkt.Layer(layers.LayerTypeTCP); tcpLayer != nil {
-				tcp, _ := tcpLayer.(*layers.TCP)
-				if len(tcp.Payload) > 0 {
-					if sni := extractSNI(tcp.Payload); sni != "" {
-						detected = containsAIDomain(sni)
+			// TLS SNI
+			if detected == "" {
+				if tcpLayer := pkt.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+					tcp, _ := tcpLayer.(*layers.TCP)
+					if len(tcp.Payload) > 0 {
+						if sni := extractSNI(tcp.Payload); sni != "" {
+							detected = containsAIDomain(sni)
+						}
 					}
 				}
 			}
-		}
 
-		// Layer 3 — Plain HTTP Host header (TCP 80).
-		if detected == "" {
-			if app := pkt.ApplicationLayer(); app != nil {
-				detected = containsAIDomain(string(app.Payload()))
+			// Plain HTTP Host header
+			if detected == "" {
+				if app := pkt.ApplicationLayer(); app != nil {
+					detected = containsAIDomain(string(app.Payload()))
+				}
 			}
-		}
 
-		if detected != "" {
-			recordHit(contest, srcIP, detected)
+			if detected != "" {
+				recordHit(contest, srcIP, detected)
+			}
 		}
 	}
 }
 
 // ── Hit recording ─────────────────────────────────────────────────────────────
 
-// recordHit writes a detection event to all three contest tables:
-//  1. traffic_logs  — full unbounded history (every single hit).
-//  2. ai_hits       — deduplicated per IP+domain within a 10-minute window
-//     (prevents log flooding while still recording repeat visits).
-//  3. participants  — sets ai_violation=1 and updates last_seen for the team.
 func recordHit(contest Contest, srcIP, domain string) {
-	// 1. Full traffic history.
+	// Store UTC timestamps in DB (consistent with loc=UTC DSN).
 	tlQ := fmt.Sprintf(
-		"INSERT INTO `%s` (ip, ai_service, timestamp) VALUES (?, ?, NOW(3))",
+		"INSERT INTO `%s` (ip, ai_service, timestamp) VALUES (?, ?, UTC_TIMESTAMP(3))",
 		contest.TrafficLogsTable,
 	)
 	if _, err := sqlDB.Exec(tlQ, srcIP, domain); err != nil {
 		log.Printf("[SNIFFER] traffic_logs insert error: %v", err)
 	}
 
-	// 2. Deduped ai_hits — only insert if no matching row in the last 10 minutes.
+	// Deduped ai_hits — skip if same IP+domain hit within last 10 minutes.
 	ahQ := fmt.Sprintf(`
 		INSERT INTO `+"`%s`"+` (contest_id, ip, domain, created_at)
-		SELECT ?, ?, ?, NOW(3)
+		SELECT ?, ?, ?, UTC_TIMESTAMP(3)
 		WHERE NOT EXISTS (
 			SELECT 1 FROM `+"`%s`"+`
 			WHERE ip = ? AND domain = ?
-			  AND created_at >= NOW(3) - INTERVAL 10 MINUTE
+			  AND created_at >= UTC_TIMESTAMP(3) - INTERVAL 10 MINUTE
 		)`,
 		contest.AIHitsTable, contest.AIHitsTable,
 	)
@@ -533,9 +610,9 @@ func recordHit(contest Contest, srcIP, domain string) {
 		log.Printf("[SNIFFER] ai_hits insert error: %v", err)
 	}
 
-	// 3. Flag the participant and record when the violation last occurred.
+	// Flag the participant.
 	updQ := fmt.Sprintf(
-		"UPDATE `%s` SET ai_violation = 1, last_seen = NOW() WHERE ip = ?",
+		"UPDATE `%s` SET ai_violation = 1, last_seen = UTC_TIMESTAMP() WHERE ip = ?",
 		contest.TableName,
 	)
 	res, err := sqlDB.Exec(updQ, srcIP)
@@ -556,10 +633,37 @@ func hostContest(c *gin.Context) {
 		return
 	}
 
+	// The frontend sends the user's local BST time as "YYYY-MM-DDTHH:MM".
+	// We parse it explicitly in BST (Asia/Dhaka = UTC+6) then store as UTC.
+	contestTimeStr := strings.TrimSpace(c.PostForm("contestTime"))
+	var startTime time.Time
+	if contestTimeStr == "" {
+		startTime = time.Now().UTC()
+	} else {
+		formats := []string{
+			"2006-01-02T15:04",
+			"2006-01-02T15:04:05",
+			time.RFC3339,
+		}
+		var parseErr error
+		for _, f := range formats {
+			var t time.Time
+			t, parseErr = time.ParseInLocation(f, contestTimeStr, bst)
+			if parseErr == nil {
+				startTime = t.UTC() // store as UTC
+				break
+			}
+		}
+		if parseErr != nil {
+			c.JSON(400, gin.H{"error": "invalid contestTime format"})
+			return
+		}
+	}
+
 	durationStr := c.PostForm("duration")
-	duration, err := time.ParseDuration(durationStr + "m")
-	if err != nil || duration <= 0 {
-		c.JSON(400, gin.H{"error": "invalid duration (positive integer minutes expected)"})
+	durationMin, err := time.ParseDuration(durationStr + "m")
+	if err != nil || durationMin <= 0 || durationMin > 24*time.Hour {
+		c.JSON(400, gin.H{"error": "invalid duration (1–1440 minutes expected)"})
 		return
 	}
 
@@ -568,8 +672,11 @@ func hostContest(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "csv file required"})
 		return
 	}
+	if !strings.HasSuffix(strings.ToLower(file.Filename), ".csv") {
+		c.JSON(400, gin.H{"error": "uploaded file must be a .csv"})
+		return
+	}
 
-	// Nanosecond suffix guarantees unique table names even under rapid requests.
 	ts := time.Now().UnixNano()
 	participantTable := fmt.Sprintf("contest_%d", ts)
 	trafficTable := fmt.Sprintf("traffic_logs_%d", ts)
@@ -621,11 +728,11 @@ func hostContest(c *gin.Context) {
 		}
 	}
 
-	now := time.Now()
+	endTime := startTime.Add(durationMin)
 	contest := Contest{
 		Name:             name,
-		StartTime:        now,
-		EndTime:          now.Add(duration),
+		StartTime:        startTime,
+		EndTime:          endTime,
 		TableName:        participantTable,
 		TrafficLogsTable: trafficTable,
 		AIHitsTable:      aiHitsTable,
@@ -637,7 +744,6 @@ func hostContest(c *gin.Context) {
 	}
 
 	go startSniffer(contest)
-
 	c.JSON(200, contest)
 }
 
@@ -647,6 +753,7 @@ func deleteContest(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "contest not found"})
 		return
 	}
+	stopSniffer(contest.ID)
 	for _, tbl := range []string{contest.TableName, contest.TrafficLogsTable, contest.AIHitsTable} {
 		if tbl == "" {
 			continue
@@ -677,7 +784,7 @@ func monitorTelemetry(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	statuses := []TeamStatus{}
+	statuses := make([]TeamStatus, 0)
 	for rows.Next() {
 		var s TeamStatus
 		var v int
@@ -693,12 +800,10 @@ func monitorTelemetry(c *gin.Context) {
 		}
 		s.LastSeen = "Never"
 		if ls.Valid {
-			s.LastSeen = ls.Time.Format("15:04:05")
+			// DB stores UTC; display in BST.
+			s.LastSeen = fmtBST(ls.Time)
 		}
 		statuses = append(statuses, s)
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("[MONITOR] rows error: %v", err)
 	}
 	c.JSON(200, statuses)
 }
@@ -729,7 +834,7 @@ func getViolations(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	violations := []ViolationTeam{}
+	violations := make([]ViolationTeam, 0)
 	for rows.Next() {
 		var teamName, membersRaw, ip, domain string
 		var ls sql.NullTime
@@ -739,7 +844,7 @@ func getViolations(c *gin.Context) {
 		}
 		detectedAt := "Unknown"
 		if ls.Valid {
-			detectedAt = ls.Time.Format("15:04:05")
+			detectedAt = fmtBST(ls.Time)
 		}
 		violations = append(violations, ViolationTeam{
 			TeamName:   teamName,
@@ -748,9 +853,6 @@ func getViolations(c *gin.Context) {
 			DetectedAt: detectedAt,
 			Domain:     domain,
 		})
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("[VIOLATIONS] rows error: %v", err)
 	}
 	c.JSON(200, violations)
 }
@@ -777,7 +879,7 @@ func getAIHits(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	hits := []AIHitDetail{}
+	hits := make([]AIHitDetail, 0)
 	for rows.Next() {
 		var ip, domain string
 		var teamName, membersRaw sql.NullString
@@ -788,13 +890,13 @@ func getAIHits(c *gin.Context) {
 		}
 		hitTime := "Unknown"
 		if createdAt.Valid {
-			hitTime = createdAt.Time.Format("15:04:05")
+			hitTime = fmtBST(createdAt.Time)
 		}
 		team := "Unknown"
 		if teamName.Valid {
 			team = teamName.String
 		}
-		members := []string{}
+		members := make([]string, 0)
 		if membersRaw.Valid {
 			members = splitMembers(membersRaw.String)
 		}
@@ -806,29 +908,42 @@ func getAIHits(c *gin.Context) {
 			HitTime:  hitTime,
 		})
 	}
-	if err := rows.Err(); err != nil {
-		log.Printf("[AI-HITS] rows error: %v", err)
-	}
 	c.JSON(200, hits)
 }
 
 func getContests(c *gin.Context) {
 	var list []Contest
-	db.Find(&list)
+	if err := db.Find(&list).Error; err != nil {
+		c.JSON(500, gin.H{"error": "failed to fetch contests"})
+		return
+	}
 	c.JSON(200, list)
 }
 
 func register(c *gin.Context) {
 	var in struct {
-		FirstName string `json:"FirstName"`
-		LastName  string `json:"LastName"`
-		Email     string `json:"Email"`
-		Password  string `json:"Password"`
+		FirstName string `json:"firstName"`
+		LastName  string `json:"lastName"`
+		Email     string `json:"email"`
+		Password  string `json:"password"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(400, gin.H{"error": "invalid request body"})
 		return
 	}
+	in.FirstName = strings.TrimSpace(in.FirstName)
+	in.LastName = strings.TrimSpace(in.LastName)
+	in.Email = strings.TrimSpace(strings.ToLower(in.Email))
+
+	if in.FirstName == "" || in.Email == "" || in.Password == "" {
+		c.JSON(400, gin.H{"error": "firstName, email and password are required"})
+		return
+	}
+	if len(in.Password) < 6 {
+		c.JSON(400, gin.H{"error": "password must be at least 6 characters"})
+		return
+	}
+
 	pw, err := bcrypt.GenerateFromPassword([]byte(in.Password), 10)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "failed to hash password"})
@@ -839,6 +954,10 @@ func register(c *gin.Context) {
 		Email:    in.Email,
 		Password: string(pw),
 	}).Error; err != nil {
+		if strings.Contains(err.Error(), "Duplicate") {
+			c.JSON(409, gin.H{"error": "email already registered"})
+			return
+		}
 		c.JSON(500, gin.H{"error": "failed to create user"})
 		return
 	}
@@ -847,34 +966,24 @@ func register(c *gin.Context) {
 
 func login(c *gin.Context) {
 	var in struct {
-		Email    string `json:"Email"`
-		Password string `json:"Password"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(400, gin.H{"error": "invalid request body"})
 		return
 	}
 	var u User
-	if err := db.Where("email = ?", in.Email).First(&u).Error; err == nil {
+	if err := db.Where("email = ?", strings.TrimSpace(strings.ToLower(in.Email))).First(&u).Error; err == nil {
 		if err := bcrypt.CompareHashAndPassword([]byte(u.Password), []byte(in.Password)); err == nil {
-			token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"user_id": u.ID})
+			token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+				"user_id": u.ID,
+				"exp":     time.Now().Add(24 * time.Hour).Unix(),
+			})
 			t, _ := token.SignedString(jwtSecret)
 			c.JSON(200, gin.H{"token": t, "user": u})
 			return
 		}
 	}
-	c.JSON(401, gin.H{"error": "unauthorized"})
-}
-
-// ── Utilities ─────────────────────────────────────────────────────────────────
-
-func splitMembers(raw string) []string {
-	parts := strings.Split(raw, ",")
-	var out []string
-	for _, p := range parts {
-		if t := strings.TrimSpace(p); t != "" {
-			out = append(out, t)
-		}
-	}
-	return out
+	c.JSON(401, gin.H{"error": "invalid email or password"})
 }

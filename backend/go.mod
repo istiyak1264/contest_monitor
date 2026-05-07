@@ -25,6 +25,7 @@ require (
 	github.com/goccy/go-yaml v1.19.2 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/gopacket v1.1.19
+	github.com/google/uuid v1.6.0
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/jinzhu/now v1.1.5 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect

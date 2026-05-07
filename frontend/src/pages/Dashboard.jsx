@@ -1,47 +1,76 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import {
-  FaTrophy,
-  FaClock,
-  FaTerminal,
-  FaTrashAlt,
-  FaExclamationTriangle,
-  FaCheck,
-  FaTimes,
-  FaSatellite,
+  FaTrophy, FaClock, FaTerminal, FaTrashAlt,
+  FaExclamationTriangle, FaCheck, FaTimes, FaSatellite,
 } from "react-icons/fa";
 import styles from "./Dashboard.module.css";
 
 const API = import.meta.env.VITE_API_URL;
+
+function authHeaders(navigate) {
+  const token = localStorage.getItem("token");
+  if (!token) { navigate("/login"); return null; }
+  return { Authorization: `Bearer ${token}` };
+}
+
+/** Format a millisecond diff into HH:MM:SS */
+function fmtCountdown(diff) {
+  const h = Math.floor(diff / 3600000);
+  const m = Math.floor((diff % 3600000) / 60000);
+  const s = Math.floor((diff % 60000) / 1000);
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
 
 const Dashboard = () => {
   const [contests, setContests]     = useState([]);
   const [loading, setLoading]       = useState(true);
   const [timeLeft, setTimeLeft]     = useState({});
   const [deletingId, setDeletingId] = useState(null);
-
   const navigate = useNavigate();
 
   const fetchContests = useCallback(async () => {
+    const hdrs = authHeaders(navigate);
+    if (!hdrs) return;
     try {
-      const response = await fetch(`${API}/contests`);
-      if (response.ok) {
-        const data = await response.json();
-        setContests(data);
+      const res = await fetch(`${API}/contests`, { headers: hdrs });
+      if (res.status === 401) { navigate("/login"); return; }
+      if (res.ok) {
+        const data = await res.json();
+        setContests(Array.isArray(data) ? data : []);
       }
     } catch (err) {
       console.error("Sync Error:", err);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [navigate]);
 
   useEffect(() => { fetchContests(); }, [fetchContests]);
 
+  // Countdown ticker
+  useEffect(() => {
+    if (contests.length === 0) return;
+    const tick = () => {
+      const now = Date.now();
+      const next = {};
+      contests.forEach(({ id, start_time }) => {
+        const diff = new Date(start_time).getTime() - now;
+        next[id] = diff <= 0 ? "LIVE" : fmtCountdown(diff);
+      });
+      setTimeLeft(next);
+    };
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [contests]);
+
   const confirmDelete = async (id) => {
+    const hdrs = authHeaders(navigate);
+    if (!hdrs) return;
     try {
-      const response = await fetch(`${API}/contests/${id}`, { method: "DELETE" });
-      if (response.ok) {
+      const res = await fetch(`${API}/contests/${id}`, { method: "DELETE", headers: hdrs });
+      if (res.ok) {
         setContests((prev) => prev.filter((c) => c.id !== id));
         setDeletingId(null);
       }
@@ -49,28 +78,6 @@ const Dashboard = () => {
       console.error("Delete Error:", err);
     }
   };
-
-  useEffect(() => {
-    if (contests.length === 0) return;
-    const timer = setInterval(() => {
-      const now = new Date();
-      const newTimeLeft = {};
-      contests.forEach((contest) => {
-        const diff = new Date(contest.start_time) - now;
-        if (diff <= 0) {
-          newTimeLeft[contest.id] = "LIVE";
-        } else {
-          const h = Math.floor(diff / 3600000);
-          const m = Math.floor((diff % 3600000) / 60000);
-          const s = Math.floor((diff % 60000) / 1000);
-          newTimeLeft[contest.id] =
-            `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-        }
-      });
-      setTimeLeft(newTimeLeft);
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [contests]);
 
   return (
     <div className={styles.container}>
@@ -103,7 +110,11 @@ const Dashboard = () => {
                         <FaTrophy className={styles.trophySmall} />
                         <h3>{contest.name}</h3>
                       </div>
-                      <button className={styles.deleteIconBtn} onClick={() => setDeletingId(contest.id)}>
+                      <button
+                        className={styles.deleteIconBtn}
+                        onClick={() => setDeletingId(contest.id)}
+                        aria-label="Delete contest"
+                      >
                         <FaTrashAlt />
                       </button>
                     </div>

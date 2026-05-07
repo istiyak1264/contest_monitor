@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from "react";
 import { Link, useNavigate } from "react-router-dom";
+import { apiPost } from "../api";
 import styles from "./Login.module.css";
 
-const API           = import.meta.env.VITE_API_URL;
 const SUBTITLE_TEXT = "// secure access portal";
 
 const Login = () => {
@@ -12,7 +12,6 @@ const Login = () => {
   const [error, setError]       = useState("");
   const [typed, setTyped]       = useState("");
 
-  /* Typing animation for subtitle */
   useEffect(() => {
     let i = 0;
     const interval = setInterval(() => {
@@ -28,22 +27,20 @@ const Login = () => {
     setError("");
 
     try {
-      const response = await fetch(`${API}/login`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
-      });
-
+      const response = await apiPost("/login", { email, password });
       const data = await response.json();
+
       if (response.ok) {
         localStorage.setItem("token", data.token);
         localStorage.setItem("user", JSON.stringify(data.user));
+        // Notify Navbar in the same tab
+        window.dispatchEvent(new Event("authChange"));
         navigate("/dashboard");
       } else {
         setError(data.error || "Login failed");
       }
-    } catch (err) {
-      setError("Cannot connect to server. Check if Go backend is running.");
+    } catch {
+      setError("Cannot connect to server. Check if the backend is running.");
     }
   };
 
@@ -53,6 +50,7 @@ const Login = () => {
 
       <form className={styles.form} onSubmit={handleSubmit}>
         <h2 className={styles.title}>User Login</h2>
+        <p className={styles.subtitle}>{typed}<span className={styles.caret}>|</span></p>
 
         {error && <p key={error} className={styles.error}>{error}</p>}
 
@@ -64,6 +62,7 @@ const Login = () => {
             type="email"
             placeholder="example@mail.com"
             required
+            value={email}
             onChange={(e) => setEmail(e.target.value)}
           />
         </div>
@@ -76,6 +75,7 @@ const Login = () => {
             type="password"
             placeholder="••••••••••••"
             required
+            value={password}
             onChange={(e) => setPassword(e.target.value)}
           />
         </div>

@@ -69,7 +69,6 @@
   overflow-x: hidden;
 }
 
-/* Scrolling grid */
 .container::before {
   content: '';
   position: fixed;
@@ -83,7 +82,6 @@
   z-index: 0;
 }
 
-/* Radial orb */
 .container::after {
   content: '';
   position: fixed;
@@ -97,7 +95,6 @@
   z-index: 0;
 }
 
-/* Scanline */
 .scanline {
   position: fixed;
   left: 0;
@@ -165,7 +162,7 @@
 /* ── Grid ── */
 .contestGrid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   gap: 20px;
 }
 
@@ -180,12 +177,12 @@
   display: flex;
   flex-direction: column;
   justify-content: space-between;
+  gap: 1rem;
   animation:
     cardReveal  0.5s cubic-bezier(0.16,1,0.3,1) both,
     borderPulse 5s ease-in-out 1s infinite;
 }
 
-/* Corner brackets on card */
 .contestCard::before,
 .contestCard::after {
   content: '';
@@ -215,10 +212,12 @@
   display: flex;
   align-items: center;
   gap: 10px;
+  min-width: 0;
 }
 
 .trophySmall {
   color: var(--green);
+  flex-shrink: 0;
   filter: drop-shadow(0 0 6px rgba(0,255,65,0.4));
 }
 
@@ -228,6 +227,9 @@
   color: #d8fde0;
   font-family: var(--mono);
   letter-spacing: 0.08em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .deleteIconBtn {
@@ -238,6 +240,7 @@
   font-size: 0.9rem;
   padding: 4px 6px;
   border-radius: 3px;
+  flex-shrink: 0;
   transition: color 0.2s, border-color 0.2s, box-shadow 0.2s;
 }
 .deleteIconBtn:hover {
@@ -247,13 +250,15 @@
 }
 
 /* ── Timer ── */
-.timerWrapper .label {
+.timerWrapper { flex: 1; }
+
+.label {
   font-size: 0.6rem;
   color: rgba(0,255,65,0.28);
   font-family: var(--mono);
   text-transform: uppercase;
   letter-spacing: 0.12em;
-  margin-bottom: 0.5rem;
+  margin: 0 0 0.5rem;
 }
 
 .countdown {
@@ -289,10 +294,15 @@
   animation: livePulse 2s ease-in-out infinite;
 }
 
+/* ── Card actions (was missing — caused manageBtn to have no container) ── */
+.cardActions {
+  margin-top: auto;
+}
+
 /* ── Manage button ── */
 .manageBtn {
   width: 100%;
-  padding: 0.78rem 1rem;
+  padding: 0.75rem 1rem;
   border-radius: 3px;
   border: 1px solid var(--green);
   background: rgba(0,255,65,0.06);
@@ -304,6 +314,9 @@
   cursor: pointer;
   position: relative;
   overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   transition: background 0.25s, box-shadow 0.25s;
 }
 .manageBtn::before {
@@ -328,8 +341,7 @@
   align-items: center;
   justify-content: center;
   gap: 10px;
-  height: 100%;
-  min-height: 190px;
+  flex: 1;
 }
 
 .warnIcon {
@@ -348,9 +360,9 @@
 }
 
 .deleteNote {
-  color: rgba(0,255,65,0.25) !important;
+  color: rgba(0,255,65,0.25);
   font-family: var(--mono);
-  font-size: 0.68rem !important;
+  font-size: 0.68rem;
   text-align: center;
   margin: 0;
 }
@@ -425,4 +437,10 @@
   font-size: 2rem;
   margin-bottom: 1rem;
   color: rgba(0,255,65,0.15);
+}
+
+/* ── Responsive ── */
+@media (max-width: 600px) {
+  .container { padding: 1.5rem; }
+  .contestGrid { grid-template-columns: 1fr; }
 }

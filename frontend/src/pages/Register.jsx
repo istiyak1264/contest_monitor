@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from "react";
 import { Link, useNavigate } from "react-router-dom";
+import { apiPost } from "../api";
 import styles from "./Register.module.css";
 
-const API           = import.meta.env.VITE_API_URL;
 const SUBTITLE_TEXT = "// create secure account";
 
 const Register = () => {
@@ -14,10 +14,9 @@ const Register = () => {
     password: "",
     confirmPassword: ""
   });
-  const [error, setError]   = useState("");
-  const [typed, setTyped]   = useState("");
+  const [error, setError] = useState("");
+  const [typed, setTyped] = useState("");
 
-  /* Typing animation for subtitle */
   useEffect(() => {
     let i = 0;
     const interval = setInterval(() => {
@@ -35,17 +34,16 @@ const Register = () => {
     if (formData.password !== formData.confirmPassword) {
       return setError("Passwords do not match");
     }
+    if (formData.password.length < 6) {
+      return setError("Password must be at least 6 characters");
+    }
 
     try {
-      const response = await fetch(`${API}/register`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          firstName: formData.firstName,
-          lastName:  formData.lastName,
-          email:     formData.email,
-          password:  formData.password
-        }),
+      const response = await apiPost("/register", {
+        firstName: formData.firstName,
+        lastName:  formData.lastName,
+        email:     formData.email,
+        password:  formData.password,
       });
 
       const data = await response.json();
@@ -54,8 +52,8 @@ const Register = () => {
       } else {
         setError(data.error || "Registration failed");
       }
-    } catch (err) {
-      setError("Cannot connect to server. Check if Go backend is running.");
+    } catch {
+      setError("Cannot connect to server. Check if the backend is running.");
     }
   };
 
@@ -65,6 +63,7 @@ const Register = () => {
 
       <form className={styles.form} onSubmit={handleSubmit}>
         <h2 className={styles.title}>Add New User</h2>
+        <p className={styles.subtitle}>{typed}<span className={styles.caret}>|</span></p>
 
         {error && <p key={error} className={styles.error}>{error}</p>}
 
@@ -77,6 +76,7 @@ const Register = () => {
               type="text"
               placeholder="John"
               required
+              value={formData.firstName}
               onChange={(e) => setFormData({ ...formData, firstName: e.target.value })}
             />
           </div>
@@ -87,7 +87,7 @@ const Register = () => {
               className={styles.input}
               type="text"
               placeholder="Doe"
-              required
+              value={formData.lastName}
               onChange={(e) => setFormData({ ...formData, lastName: e.target.value })}
             />
           </div>
@@ -101,6 +101,7 @@ const Register = () => {
             type="email"
             placeholder="example@mail.com"
             required
+            value={formData.email}
             onChange={(e) => setFormData({ ...formData, email: e.target.value })}
           />
         </div>
@@ -113,6 +114,7 @@ const Register = () => {
             type="password"
             placeholder="••••••••••••"
             required
+            value={formData.password}
             onChange={(e) => setFormData({ ...formData, password: e.target.value })}
           />
         </div>
@@ -125,6 +127,7 @@ const Register = () => {
             type="password"
             placeholder="••••••••••••"
             required
+            value={formData.confirmPassword}
             onChange={(e) => setFormData({ ...formData, confirmPassword: e.target.value })}
           />
         </div>

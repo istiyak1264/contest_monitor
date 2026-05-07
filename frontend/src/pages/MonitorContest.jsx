@@ -7,9 +7,26 @@ import {
 } from "react-icons/fa";
 import styles from "./MonitorContest.module.css";
 
-
 const API           = import.meta.env.VITE_API_URL;
 const POLL_INTERVAL = 3000;
+
+function getAuthHeader(navigate) {
+  const token = localStorage.getItem("token");
+  if (!token) { navigate("/login"); return null; }
+  return { Authorization: `Bearer ${token}` };
+}
+
+/** Safe JSON fetch — returns null on non-OK or network error. */
+async function apiFetch(url, headers) {
+  try {
+    const res = await fetch(url, { cache: "no-store", headers });
+    if (res.status === 401) return { unauthorized: true };
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
 
 const MonitorContest = () => {
   const [tab, setTab]               = useState("monitor");
@@ -42,81 +59,67 @@ const MonitorContest = () => {
     audioRef.current.play().catch(() => {});
   }, []);
 
+  // ── Contest picker (no id in URL) ─────────────────────────────────────────
   useEffect(() => {
-    if (!contestId) {
-      setPickerLoading(true);
-      fetch(`${API}/contests`)
-        .then((r) => r.json())
-        .then((data) => setContests(Array.isArray(data) ? data : []))
-        .catch(() => setContests([]))
-        .finally(() => setPickerLoading(false));
-    }
-  }, [contestId]);
+    if (contestId) return;
+    const hdrs = getAuthHeader(navigate);
+    if (!hdrs) return;
+    setPickerLoading(true);
+    apiFetch(`${API}/contests`, hdrs)
+      .then((data) => {
+        if (data?.unauthorized) { navigate("/login"); return; }
+        setContests(Array.isArray(data) ? data : []);
+      })
+      .finally(() => setPickerLoading(false));
+  }, [contestId, navigate]);
 
-  const fetchTelemetry = useCallback(async () => {
+  // ── Polling ───────────────────────────────────────────────────────────────
+  const poll = useCallback(async () => {
     if (!contestId) return;
-    try {
-      const res = await fetch(`${API}/contests/${contestId}/monitor`, { cache: "no-store" });
-      if (!res.ok) throw new Error(`Server returned ${res.status}`);
-      const raw = await res.json();
-      setTeams(Array.isArray(raw) ? raw : []);
+    const hdrs = getAuthHeader(navigate);
+    if (!hdrs) return;
+
+    // Fire all three requests in parallel
+    const [teamsData, violData, hitsData] = await Promise.all([
+      apiFetch(`${API}/contests/${contestId}/monitor`, hdrs),
+      apiFetch(`${API}/contests/${contestId}/violations`, hdrs),
+      apiFetch(`${API}/contests/${contestId}/ai-hits`, hdrs),
+    ]);
+
+    if (teamsData?.unauthorized || violData?.unauthorized || hitsData?.unauthorized) {
+      navigate("/login");
+      return;
+    }
+
+    if (teamsData === null) {
+      setError("Connection error — retrying...");
+    } else {
+      setTeams(Array.isArray(teamsData) ? teamsData : []);
       setError(null);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  }, [contestId]);
-
-  const fetchViolations = useCallback(async () => {
-    if (!contestId) return;
-    try {
-      const res = await fetch(`${API}/contests/${contestId}/violations`, { cache: "no-store" });
-      if (!res.ok) return;
-      const raw = await res.json();
-      const data = Array.isArray(raw) ? raw : [];
-
-      // Play sound if new violations appeared
-      if (data.length > prevViolations.current) {
-        playAlert();
-      }
-      prevViolations.current = data.length;
-
-      setViolations(data);
       setLastSync(new Date());
-    } catch (_) {}
-  }, [contestId, playAlert]);
+    }
 
-  const fetchAIHits = useCallback(async () => {
-    if (!contestId) return;
-    try {
-      const res = await fetch(`${API}/contests/${contestId}/ai-hits`, { cache: "no-store" });
-      if (!res.ok) return;
-      const raw = await res.json();
-      const data = Array.isArray(raw) ? raw : [];
+    if (Array.isArray(violData)) {
+      if (violData.length > prevViolations.current) playAlert();
+      prevViolations.current = violData.length;
+      setViolations(violData);
+    }
 
-      // Play sound if new AI hits appeared
-      if (data.length > prevAiHits.current) {
-        playAlert();
-      }
-      prevAiHits.current = data.length;
+    if (Array.isArray(hitsData)) {
+      if (hitsData.length > prevAiHits.current) playAlert();
+      prevAiHits.current = hitsData.length;
+      setAiHits(hitsData);
+    }
 
-      setAiHits(data);
-    } catch (_) {}
-  }, [contestId, playAlert]);
+    setLoading(false);
+  }, [contestId, navigate, playAlert]);
 
   useEffect(() => {
     if (!contestId) return;
-    fetchTelemetry();
-    fetchViolations();
-    fetchAIHits();
-    intervalRef.current = setInterval(() => {
-      fetchTelemetry();
-      fetchViolations();
-      fetchAIHits();
-    }, POLL_INTERVAL);
+    poll();
+    intervalRef.current = setInterval(poll, POLL_INTERVAL);
     return () => clearInterval(intervalRef.current);
-  }, [contestId, fetchTelemetry, fetchViolations, fetchAIHits]);
+  }, [contestId, poll]);
 
   const syncLabel = lastSync
     ? lastSync.toLocaleTimeString("en-BD", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
@@ -124,7 +127,7 @@ const MonitorContest = () => {
 
   const violationCount = teams.filter((t) => t.is_warning === true || t.is_warning === 1).length;
 
-  /* ── No ID → picker ── */
+  /* ── Contest picker ── */
   if (!contestId) {
     return (
       <div className={styles.container}>
@@ -156,7 +159,7 @@ const MonitorContest = () => {
               >
                 <FaSatellite className={styles.pickerIcon} />
                 <span className={styles.pickerName}>{c.name}</span>
-                <span className={styles.pickerSub}>Contest #{c.id} — click to monitor</span>
+                <span className={styles.pickerSub}>Click to monitor</span>
               </button>
             ))}
           </div>
@@ -198,7 +201,7 @@ const MonitorContest = () => {
       {/* Error */}
       {error && (
         <div className={styles.errorBanner}>
-          <FaWifi />&nbsp;[ERR] Connection error: {error} — retrying in {POLL_INTERVAL / 1000}s…
+          <FaWifi />&nbsp;[ERR] {error}
         </div>
       )}
 
@@ -226,7 +229,7 @@ const MonitorContest = () => {
             <section className={styles.violationPanel}>
               <div className={styles.violationPanelHeader}>
                 <FaBan className={styles.violationPanelIcon} />
-                <span>AI USAGE DETECTED — {violations.length} TEAM{violations.length > 1 ? "S" : ""} FLAGGED</span>
+                <span>AI USAGE DETECTED — {violations.length} TEAM{violations.length !== 1 ? "S" : ""} FLAGGED</span>
               </div>
               <div className={styles.violationList}>
                 {violations.map((v, i) => (
@@ -235,7 +238,10 @@ const MonitorContest = () => {
                       <FaSkull className={styles.skullIcon} />
                       <span className={styles.violationTeamName}>{v.team_name}</span>
                       <code className={styles.violationIP}>{v.ip}</code>
-                      <span className={styles.violationTime2}><FaClock />&nbsp;{v.detected_at} BST</span>
+                      {/* Fixed: was styles.violationTime2, now styles.violationTimestamp */}
+                      <span className={styles.violationTimestamp}>
+                        <FaClock />&nbsp;{v.detected_at} BST
+                      </span>
                     </div>
                     <div className={styles.violationMembers}>
                       <FaIdBadge className={styles.membersBadgeIcon} />
@@ -295,7 +301,7 @@ const MonitorContest = () => {
                       {isViolation ? (
                         <div className={styles.violationTime}>
                           <FaClock />
-                          <span>Detected at: <strong>{team.last_seen}</strong> BST</span>
+                          <span>Detected: <strong>{team.last_seen} BST</strong></span>
                         </div>
                       ) : (
                         <span className={styles.cleanFooter}>✓ No violations logged</span>
