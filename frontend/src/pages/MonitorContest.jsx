@@ -16,7 +16,6 @@ function getAuthHeader(navigate) {
   return { Authorization: `Bearer ${token}` };
 }
 
-/** Safe JSON fetch — returns null on non-OK or network error. */
 async function apiFetch(url, headers) {
   try {
     const res = await fetch(url, { cache: "no-store", headers });
@@ -185,8 +184,6 @@ const MonitorContest = () => {
               <span className={violationCount > 0 ? styles.danger : styles.count}>{violationCount}</span>
               &ensp;|&ensp;AI Hits:&nbsp;
               <span className={aiHits.length > 0 ? styles.danger : styles.count}>{aiHits.length}</span>
-              &ensp;|&ensp;Synced:&nbsp;<span className={styles.count}>{syncLabel}</span>
-              &ensp;|&ensp;<span className={styles.online}>BST (UTC+6)</span>
             </p>
           </div>
         </div>
