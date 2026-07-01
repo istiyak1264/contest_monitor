@@ -7,6 +7,8 @@ import Login from "./pages/Login";
 import Register from "./pages/Register";
 import About from "./pages/About";
 import HostContest from "./pages/HostContest";
+import Admin from "./pages/Admin";
+import AdminRoute from "./pages/AdminRoute";
 
 // Redirects to /login if no token is present
 const ProtectedRoute = ({ children }) => {
@@ -28,6 +30,9 @@ const App = () => {
         <Route path="/dashboard"       element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
         <Route path="/monitor-contest" element={<ProtectedRoute><MonitorContest /></ProtectedRoute>} />
         <Route path="/host-contest"    element={<ProtectedRoute><HostContest /></ProtectedRoute>} />
+
+        {/* Admin-only — 403 for anonymous or non-admin users */}
+        <Route path="/admin" element={<AdminRoute><Admin /></AdminRoute>} />
       </Routes>
     </Router>
   );

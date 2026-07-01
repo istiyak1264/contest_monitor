@@ -26,10 +26,10 @@ import (
 )
 
 // ── Timezone ──────────────────────────────────────────────────────────────────
-
 var bst = func() *time.Location {
 	loc, err := time.LoadLocation("Asia/Dhaka")
 	if err != nil {
+		// Fallback: fixed offset UTC+6 (same as Asia/Dhaka, no DST)
 		loc = time.FixedZone("BST", 6*3600)
 	}
 	return loc
@@ -42,12 +42,12 @@ func nowBST() time.Time { return time.Now().In(bst) }
 func fmtBST(t time.Time) string { return t.In(bst).Format("15:04:05") }
 
 // ── Models ────────────────────────────────────────────────────────────────────
-
 type User struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	Email    string `json:"email"`
 	Password string `json:"password,omitempty"`
+	Role string `json:"role"`
 }
 
 // sanitizedForClient returns a copy of the user with the password hash removed.
@@ -172,7 +172,6 @@ func splitMembers(raw string) []string {
 
 // sanitizeKey makes a string safe to use as a Firebase Realtime Database key.
 // RTDB forbids '.', '#', '$', '[', ']', '/' in keys — this is used for both
-// IP-address-based participant keys and email-based lookup keys.
 var keyReplacer = strings.NewReplacer(
 	".", "_",
 	"#", "_",
@@ -225,6 +224,7 @@ func firebaseCredentialOption() (option.ClientOption, error) {
 }
 
 // ── JWT secret init ───────────────────────────────────────────────────────────
+
 func initJWTSecret() {
 	secret := os.Getenv("JWT_SECRET")
 	if secret == "" {
@@ -259,6 +259,18 @@ func authMiddleware() gin.HandlerFunc {
 			return
 		}
 		c.Set("user_id", claims["user_id"])
+		c.Set("role", claims["role"])
+		c.Next()
+	}
+}
+
+func requireAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		role, _ := c.Get("role")
+		if role != "admin" {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "admin access required"})
+			return
+		}
 		c.Next()
 	}
 }
@@ -293,12 +305,16 @@ func main() {
 
 	auth := r.Group("/", authMiddleware())
 	{
-		auth.POST("/host-contest", hostContest)
 		auth.GET("/contests", getContests)
-		auth.DELETE("/contests/:id", deleteContest)
 		auth.GET("/contests/:id/monitor", monitorTelemetry)
 		auth.GET("/contests/:id/violations", getViolations)
 		auth.GET("/contests/:id/ai-hits", getAIHits)
+	}
+
+	admin := r.Group("/", authMiddleware(), requireAdmin())
+	{
+		admin.POST("/host-contest", hostContest)
+		admin.DELETE("/contests/:id", deleteContest)
 	}
 
 	port := getEnv("PORT", "8081")
@@ -674,8 +690,6 @@ func hostContest(c *gin.Context) {
 		return
 	}
 
-	// The frontend sends the user's local BST time as "YYYY-MM-DDTHH:MM".
-	// We parse it explicitly in BST (Asia/Dhaka = UTC+6) then store as UTC.
 	contestTimeStr := strings.TrimSpace(c.PostForm("contestTime"))
 	var startTime time.Time
 	if contestTimeStr == "" {
@@ -876,7 +890,6 @@ func getViolations(c *gin.Context) {
 	c.JSON(200, violations)
 }
 
-
 func latestDomainForIP(contestID, ip string) string {
 	var hits map[string]AIHit
 	if err := rtdb.NewRef("contests/"+contestID+"/ai_hits").OrderByChild("ip").EqualTo(ip).Get(ctx, &hits); err != nil {
@@ -1010,6 +1023,7 @@ func register(c *gin.Context) {
 		Name:     strings.TrimSpace(in.FirstName + " " + in.LastName),
 		Email:    in.Email,
 		Password: string(pw),
+		Role:     "user",
 	}
 	if err := newRef.Set(ctx, user); err != nil {
 		log.Printf("[REGISTER] write user error: %v", err)
@@ -1046,8 +1060,13 @@ func login(c *gin.Context) {
 	var u User
 	if err := rtdb.NewRef("users/"+uid).Get(ctx, &u); err == nil && u.Password != "" {
 		if err := bcrypt.CompareHashAndPassword([]byte(u.Password), []byte(in.Password)); err == nil {
+			role := u.Role
+			if role == "" {
+				role = "user"
+			}
 			token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 				"user_id": u.ID,
+				"role":    role,
 				"exp":     time.Now().Add(24 * time.Hour).Unix(),
 			})
 			t, signErr := token.SignedString(jwtSecret)
@@ -1055,12 +1074,13 @@ func login(c *gin.Context) {
 				c.JSON(500, gin.H{"error": "failed to issue token"})
 				return
 			}
-			c.JSON(200, gin.H{"token": t, "user": u.sanitizedForClient()})
+			resp := u.sanitizedForClient()
+			resp.Role = role
+			c.JSON(200, gin.H{"token": t, "user": resp})
 			return
 		}
 	}
 	c.JSON(401, gin.H{"error": "invalid email or password"})
 }
 
-// silence "declared and not used" if nowBST is ever trimmed by editors
 var _ = nowBST

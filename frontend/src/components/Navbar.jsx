@@ -6,6 +6,9 @@ import styles from "./Navbar.module.css";
 const Navbar = () => {
   const [menuOpen,  setMenuOpen]  = useState(false);
   const [isLoggedIn, setIsLoggedIn] = useState(!!localStorage.getItem("token"));
+  const [isAdminVerified, setIsAdminVerified] = useState(
+    localStorage.getItem("adminVerified") === "true"
+  );
   const [scrolled,  setScrolled]  = useState(false);
   const [glitching, setGlitching] = useState(false);
   const glitchTimer = useRef(null);
@@ -14,10 +17,17 @@ const Navbar = () => {
 
   /* ── Auth check ── */
   useEffect(() => {
-    const checkAuth = () => setIsLoggedIn(!!localStorage.getItem("token"));
+    const checkAuth = () => {
+      setIsLoggedIn(!!localStorage.getItem("token"));
+      setIsAdminVerified(localStorage.getItem("adminVerified") === "true");
+    };
     checkAuth();
     window.addEventListener("storage", checkAuth);
-    return () => window.removeEventListener("storage", checkAuth);
+    window.addEventListener("authChange", checkAuth);
+    return () => {
+      window.removeEventListener("storage", checkAuth);
+      window.removeEventListener("authChange", checkAuth);
+    };
   }, [location]);
 
   /* ── Scroll-aware compact mode ── */
@@ -55,7 +65,10 @@ const Navbar = () => {
   const handleLogout = () => {
     localStorage.removeItem("token");
     localStorage.removeItem("user");
+    localStorage.removeItem("adminVerified");
+    window.dispatchEvent(new Event("authChange"));
     setIsLoggedIn(false);
+    setIsAdminVerified(false);
     closeMenu();
     navigate("/login");
   };
@@ -104,7 +117,9 @@ const Navbar = () => {
           <>
             <NavLink to="/dashboard"       onClick={closeMenu} index={0}>Dashboard</NavLink>
             <NavLink to="/monitor-contest" onClick={closeMenu} index={1}>Monitor Contest</NavLink>
-            <NavLink to="/host-contest"    onClick={closeMenu} index={2}>Host Contest</NavLink>
+            {isAdminVerified && (
+              <NavLink to="/host-contest" onClick={closeMenu} index={2}>Host Contest</NavLink>
+            )}
           </>
         )}
       </div>

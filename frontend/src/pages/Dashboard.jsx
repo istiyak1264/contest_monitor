@@ -4,6 +4,7 @@ import {
   FaTrophy, FaClock, FaTerminal, FaTrashAlt,
   FaExclamationTriangle, FaCheck, FaTimes, FaSatellite,
 } from "react-icons/fa";
+import { getUser } from "../api";
 import styles from "./Dashboard.module.css";
 
 const API = import.meta.env.VITE_API_URL;
@@ -28,6 +29,7 @@ const Dashboard = () => {
   const [timeLeft, setTimeLeft]     = useState({});
   const [deletingId, setDeletingId] = useState(null);
   const navigate = useNavigate();
+  const isAdmin  = getUser()?.role === "admin";
 
   const fetchContests = useCallback(async () => {
     const hdrs = authHeaders(navigate);
@@ -110,13 +112,15 @@ const Dashboard = () => {
                         <FaTrophy className={styles.trophySmall} />
                         <h3>{contest.name}</h3>
                       </div>
-                      <button
-                        className={styles.deleteIconBtn}
-                        onClick={() => setDeletingId(contest.id)}
-                        aria-label="Delete contest"
-                      >
-                        <FaTrashAlt />
-                      </button>
+                      {isAdmin && (
+                        <button
+                          className={styles.deleteIconBtn}
+                          onClick={() => setDeletingId(contest.id)}
+                          aria-label="Delete contest"
+                        >
+                          <FaTrashAlt />
+                        </button>
+                      )}
                     </div>
 
                     <div className={styles.timerWrapper}>

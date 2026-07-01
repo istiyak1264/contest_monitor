@@ -1,18 +1,28 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   FaTrophy, FaCalendarAlt, FaHourglassHalf, FaFileCsv,
   FaUpload, FaCheckCircle, FaExclamationCircle, FaClock,
 } from "react-icons/fa";
+import { getUser } from "../api";
 import styles from "./HostContest.module.css";
 
-const API         = import.meta.env.VITE_API_URL || "http://127.0.0.1:8080";
+const API         = import.meta.env.VITE_API_URL;
 const MAX_DURATION = 300; // minutes
 
 // Pad number to 2 digits
 const pad = (n) => String(n).padStart(2, "0");
 
 const HostContest = () => {
+  const navigate = useNavigate();
   const today = new Date().toISOString().split("T")[0];
+
+  useEffect(() => {
+    const isAdminVerified = localStorage.getItem("adminVerified") === "true";
+    if (getUser()?.role !== "admin" || !isAdminVerified) {
+      navigate("/dashboard");
+    }
+  }, [navigate]);
 
   const [contestName, setContestName] = useState("");
   const [date, setDate]               = useState("");
@@ -26,8 +36,6 @@ const HostContest = () => {
   const hours   = Array.from({ length: 12 }, (_, i) => pad(i + 1));
   const minutes = Array.from({ length: 60 }, (_, i) => pad(i));
 
-  /** Converts 12-h picker → "YYYY-MM-DDTHH:MM" (24-h, no timezone suffix).
-   *  The backend parses this string in BST (Asia/Dhaka). */
   const buildContestTime = () => {
     let h = parseInt(hour, 10);
     if (ampm === "AM" && h === 12) h = 0;

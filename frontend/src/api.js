@@ -1,16 +1,5 @@
-// src/api.js
-// Central fetch helper — automatically attaches the JWT and the correct base URL.
+const BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8081";
 
-const BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8080";
-
-// ── Core fetch wrapper ────────────────────────────────────────────────────────
-
-/**
- * Authenticated fetch wrapper.
- * - Automatically adds Authorization header if a token exists in localStorage.
- * - Auto-logouts on 401 Unauthorized.
- * - Throws a proper Error on network failure.
- */
 export async function apiFetch(path, options = {}) {
   const token = localStorage.getItem("token");
 
@@ -37,6 +26,7 @@ export async function apiFetch(path, options = {}) {
   if (response.status === 401) {
     localStorage.removeItem("token");
     localStorage.removeItem("user");
+    localStorage.removeItem("adminVerified");
     window.dispatchEvent(new Event("authChange"));
     window.location.href = "/login";
     return response;
@@ -93,6 +83,7 @@ export function isLoggedIn() {
 export function logout() {
   localStorage.removeItem("token");
   localStorage.removeItem("user");
+  localStorage.removeItem("adminVerified");
   window.dispatchEvent(new Event("authChange"));
   window.location.href = "/login";
 }

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { FaTerminal, FaShieldAlt, FaSatelliteDish, FaLock } from "react-icons/fa";
+import { getUser } from "../api";
 import styles from "./Home.module.css";
 
 const TYPED_TEXT = "// ai detection in competitive programming";
@@ -8,6 +9,7 @@ const TYPED_TEXT = "// ai detection in competitive programming";
 const Home = () => {
   const navigate = useNavigate();
   const [typed, setTyped] = useState("");
+  const isAdmin = getUser()?.role === "admin";
 
   useEffect(() => {
     let i = 0;
@@ -63,12 +65,14 @@ const Home = () => {
           >
             &gt;&nbsp;Open Dashboard
           </button>
-          <button
-            className={styles.secondaryBtn}
-            onClick={() => handleProtectedNavigation("/host-contest")}
-          >
-            &gt;&nbsp;Host New Contest
-          </button>
+          {isAdmin && (
+            <button
+              className={styles.secondaryBtn}
+              onClick={() => handleProtectedNavigation("/host-contest")}
+            >
+              &gt;&nbsp;Host New Contest
+            </button>
+          )}
         </div>
       </div>
     </div>

@@ -1,11 +1,10 @@
 import React, { useState, useEffect } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { apiPost } from "../api";
-import styles from "./Login.module.css";
+import styles from "./Admin.module.css";
 
-const SUBTITLE_TEXT = "// secure access portal";
-
-const Login = () => {
+const SUBTITLE_TEXT = "// restricted access — administrators only";
+const Admin = () => {
   const navigate = useNavigate();
   const [email, setEmail]       = useState("");
   const [password, setPassword] = useState("");
@@ -30,16 +29,24 @@ const Login = () => {
       const response = await apiPost("/login", { email, password });
       const data = await response.json();
 
-      if (response.ok) {
-        localStorage.setItem("token", data.token);
-        localStorage.setItem("user", JSON.stringify(data.user));
-        localStorage.removeItem("adminVerified");
-        // Notify Navbar in the same tab
-        window.dispatchEvent(new Event("authChange"));
-        navigate("/dashboard");
-      } else {
+      if (!response.ok) {
         setError(data.error || "Login failed");
+        return;
       }
+
+      if (data.user?.role !== "admin") {
+        setError("This account does not have admin privileges.");
+        return;
+      }
+
+      localStorage.setItem("token", data.token);
+      localStorage.setItem("user", JSON.stringify(data.user));
+      // Marks that this admin actually authenticated through the /admin
+      // login form (not just a regular /login with an admin-role account).
+      // Nav items like "Host Contest" check this flag, not just role.
+      localStorage.setItem("adminVerified", "true");
+      window.dispatchEvent(new Event("authChange"));
+      navigate("/dashboard");
     } catch {
       setError("Cannot connect to server. Check if the backend is running.");
     }
@@ -50,7 +57,7 @@ const Login = () => {
       <div className={styles.scanline} />
 
       <form className={styles.form} onSubmit={handleSubmit}>
-        <h2 className={styles.title}>User Login</h2>
+        <h2 className={styles.title}>Admin Login</h2>
         <p className={styles.subtitle}>{typed}<span className={styles.caret}>|</span></p>
 
         {error && <p key={error} className={styles.error}>{error}</p>}
@@ -86,16 +93,16 @@ const Login = () => {
         </button>
 
         <div className={styles.divider}>
-          <span>no account yet?</span>
+          <span>not an admin?</span>
         </div>
 
         <p className={styles.registerText}>
-          Don't have an account?{" "}
-          <Link to="/register" className={styles.registerLink}>Register</Link>
+          Looking for the regular portal?{" "}
+          <Link to="/login" className={styles.registerLink}>User Login</Link>
         </p>
       </form>
     </div>
   );
 };
 
-export default Login;
+export default Admin;
