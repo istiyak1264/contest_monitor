@@ -9,8 +9,9 @@ COPY . .
 RUN go build -o main .
 
 FROM alpine:latest
-RUN apk add --no-cache libpcap
+
+RUN apk add --no-cache libpcap ca-certificates
 WORKDIR /app
 COPY --from=builder /app/main .
-EXPOSE 8080
+EXPOSE 8081
 CMD ["./main"]

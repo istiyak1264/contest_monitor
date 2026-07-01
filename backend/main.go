@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/binary"
 	"encoding/csv"
 	"fmt"
@@ -10,28 +9,27 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	firebase "firebase.google.com/go/v4"
+	"firebase.google.com/go/v4/db"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	"golang.org/x/crypto/bcrypt"
-	"gorm.io/driver/mysql"
-	"gorm.io/gorm"
+	"google.golang.org/api/option"
 )
 
 // ── Timezone ──────────────────────────────────────────────────────────────────
 
-// BST is Bangladesh Standard Time (UTC+6). All user-facing timestamps are
-// stored and displayed in this zone.
 var bst = func() *time.Location {
 	loc, err := time.LoadLocation("Asia/Dhaka")
 	if err != nil {
-		// Fallback: fixed offset UTC+6 (same as Asia/Dhaka, no DST)
 		loc = time.FixedZone("BST", 6*3600)
 	}
 	return loc
@@ -46,20 +44,46 @@ func fmtBST(t time.Time) string { return t.In(bst).Format("15:04:05") }
 // ── Models ────────────────────────────────────────────────────────────────────
 
 type User struct {
-	ID       uint   `json:"id"    gorm:"primaryKey"`
+	ID       string `json:"id"`
 	Name     string `json:"name"`
-	Email    string `json:"email" gorm:"unique"`
-	Password string `json:"-"`
+	Email    string `json:"email"`
+	Password string `json:"password,omitempty"`
+}
+
+// sanitizedForClient returns a copy of the user with the password hash removed.
+func (u User) sanitizedForClient() User {
+	u.Password = ""
+	return u
 }
 
 type Contest struct {
-	ID               uint      `json:"id"                gorm:"primaryKey"`
-	Name             string    `json:"name"`
-	StartTime        time.Time `json:"start_time"`
-	EndTime          time.Time `json:"end_time"`
-	TableName        string    `json:"table_name"`
-	TrafficLogsTable string    `json:"traffic_logs_table"`
-	AIHitsTable      string    `json:"ai_hits_table"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	StartTime time.Time `json:"start_time"`
+	EndTime   time.Time `json:"end_time"`
+}
+
+// Participant lives at contests/{contestID}/participants/{sanitizedIP}
+type Participant struct {
+	TeamName    string    `json:"team_name"`
+	IP          string    `json:"ip"`
+	Members     string    `json:"members"`
+	AIViolation bool      `json:"ai_violation"`
+	LastSeen    time.Time `json:"last_seen,omitempty"`
+}
+
+// TrafficLog lives at contests/{contestID}/traffic_logs/{pushID}
+type TrafficLog struct {
+	IP        string    `json:"ip"`
+	AIService string    `json:"ai_service"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// AIHit lives at contests/{contestID}/ai_hits/{pushID}
+type AIHit struct {
+	IP        string    `json:"ip"`
+	Domain    string    `json:"domain"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type TeamStatus struct {
@@ -90,15 +114,15 @@ type AIHitDetail struct {
 // ── Globals ───────────────────────────────────────────────────────────────────
 
 var (
-	db        *gorm.DB
-	sqlDB     *sql.DB
-	jwtSecret = []byte(getEnv("JWT_SECRET", "change-this-to-a-long-random-secret-key"))
+	ctx       = context.Background()
+	rtdb      *db.Client
+	jwtSecret []byte
 	aiDomains = []string{
 		"chatgpt", "openai", "gemini", "grok", "claude", "anthropic",
 		"perplexity", "deepseek", "manus", "stackoverflow", "geeksforgeeks",
 	}
 
-	snifferCancels   = make(map[uint]context.CancelFunc)
+	snifferCancels   = make(map[string]context.CancelFunc)
 	snifferCancelsMu sync.Mutex
 )
 
@@ -146,6 +170,69 @@ func splitMembers(raw string) []string {
 	return out
 }
 
+// sanitizeKey makes a string safe to use as a Firebase Realtime Database key.
+// RTDB forbids '.', '#', '$', '[', ']', '/' in keys — this is used for both
+// IP-address-based participant keys and email-based lookup keys.
+var keyReplacer = strings.NewReplacer(
+	".", "_",
+	"#", "_",
+	"$", "_",
+	"[", "_",
+	"]", "_",
+	"/", "_",
+)
+
+func sanitizeKey(s string) string {
+	return keyReplacer.Replace(s)
+}
+
+// ── Firebase init ─────────────────────────────────────────────────────────────
+func initFirebase() {
+	dbURL := getEnv("FIREBASE_DATABASE_URL", "")
+	if dbURL == "" {
+		log.Fatal("[FIREBASE] FIREBASE_DATABASE_URL is required (e.g. https://<project-id>-default-rtdb.<region>.firebasedatabase.app)")
+	}
+
+	opt, err := firebaseCredentialOption()
+	if err != nil {
+		log.Fatalf("[FIREBASE] %v", err)
+	}
+
+	app, err := firebase.NewApp(ctx, &firebase.Config{DatabaseURL: dbURL}, opt)
+	if err != nil {
+		log.Fatalf("[FIREBASE] app init error: %v", err)
+	}
+
+	client, err := app.Database(ctx)
+	if err != nil {
+		log.Fatalf("[FIREBASE] database client error: %v", err)
+	}
+
+	rtdb = client
+	log.Printf("[FIREBASE] connected to %s", dbURL)
+}
+
+func firebaseCredentialOption() (option.ClientOption, error) {
+	if credsJSON := os.Getenv("FIREBASE_CREDENTIALS_JSON"); credsJSON != "" {
+		return option.WithAuthCredentialsJSON(option.ServiceAccount, []byte(credsJSON)), nil
+	}
+
+	credsFile := getEnv("FIREBASE_CREDENTIALS_FILE", "/app/firebase_credentials.json")
+	if _, err := os.Stat(credsFile); err != nil {
+		return nil, fmt.Errorf("no credentials found: set FIREBASE_CREDENTIALS_JSON or mount a service account file at %s", credsFile)
+	}
+	return option.WithAuthCredentialsFile(option.ServiceAccount, credsFile), nil
+}
+
+// ── JWT secret init ───────────────────────────────────────────────────────────
+func initJWTSecret() {
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		log.Fatal("[JWT] JWT_SECRET is required — set it in .env")
+	}
+	jwtSecret = []byte(secret)
+}
+
 // ── JWT Middleware ────────────────────────────────────────────────────────────
 
 func authMiddleware() gin.HandlerFunc {
@@ -180,32 +267,8 @@ func authMiddleware() gin.HandlerFunc {
 
 func main() {
 	probeInterfaces()
-
-	// Use UTC for MySQL storage; all BST conversion happens in Go.
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:3306)/%s?charset=utf8mb4&parseTime=True&loc=UTC",
-		getEnv("DB_USER", "root"),
-		getEnv("DB_PASS", ""),
-		getEnv("DB_HOST", "127.0.0.1"),
-		getEnv("DB_NAME", "auth_db"),
-	)
-
-	var err error
-	db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
-	if err != nil {
-		log.Fatalf("[DB] connect error: %v", err)
-	}
-	sqlDB, err = db.DB()
-	if err != nil {
-		log.Fatalf("[DB] get underlying sql.DB error: %v", err)
-	}
-	// Connection pool tuning.
-	sqlDB.SetMaxOpenConns(25)
-	sqlDB.SetMaxIdleConns(10)
-	sqlDB.SetConnMaxLifetime(5 * time.Minute)
-
-	if err = db.AutoMigrate(&User{}, &Contest{}); err != nil {
-		log.Fatalf("[DB] auto-migrate error: %v", err)
-	}
+	initFirebase()
+	initJWTSecret()
 
 	resumeActiveSniffers()
 
@@ -238,22 +301,25 @@ func main() {
 		auth.GET("/contests/:id/ai-hits", getAIHits)
 	}
 
-	if err := r.Run(":8080"); err != nil {
+	port := getEnv("PORT", "8081")
+	log.Printf("[GIN] listening on :%s", port)
+	if err := r.Run(":" + port); err != nil {
 		log.Fatalf("[GIN] server error: %v", err)
 	}
 }
 
 // resumeActiveSniffers restarts packet capture for contests still active after restart.
 func resumeActiveSniffers() {
-	var contests []Contest
-	if err := db.Find(&contests).Error; err != nil {
+	var contests map[string]Contest
+	if err := rtdb.NewRef("contests").Get(ctx, &contests); err != nil {
 		log.Printf("[RESUME] could not load contests: %v", err)
 		return
 	}
 	now := time.Now().UTC()
-	for _, c := range contests {
+	for id, c := range contests {
+		c.ID = id
 		if now.Before(c.EndTime) {
-			log.Printf("[RESUME] restarting sniffer for contest %d (%s)", c.ID, c.Name)
+			log.Printf("[RESUME] restarting sniffer for contest %s (%s)", c.ID, c.Name)
 			startSniffer(c)
 		}
 	}
@@ -355,44 +421,6 @@ func getSniffInterfaces() []string {
 	return result
 }
 
-// ── Table helpers ─────────────────────────────────────────────────────────────
-
-func createParticipantsTable(name string) error {
-	q := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS `+"`%s`"+` (
-		id           INT AUTO_INCREMENT PRIMARY KEY,
-		team_name    TEXT,
-		ip           TEXT,
-		members      TEXT,
-		ai_violation TINYINT(1) DEFAULT 0,
-		last_seen    DATETIME
-	)`, name)
-	_, err := sqlDB.Exec(q)
-	return err
-}
-
-func createTrafficLogsTable(name string) error {
-	q := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS `+"`%s`"+` (
-		id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-		ip         TEXT,
-		ai_service TEXT,
-		timestamp  DATETIME(3)
-	)`, name)
-	_, err := sqlDB.Exec(q)
-	return err
-}
-
-func createAIHitsTable(name string) error {
-	q := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS `+"`%s`"+` (
-		id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-		contest_id BIGINT UNSIGNED,
-		ip         TEXT,
-		domain     TEXT,
-		created_at DATETIME(3)
-	)`, name)
-	_, err := sqlDB.Exec(q)
-	return err
-}
-
 // ── SNI extraction ────────────────────────────────────────────────────────────
 
 func extractSNI(payload []byte) string {
@@ -466,11 +494,11 @@ func extractDNSHostnames(payload []byte) []string {
 func startSniffer(contest Contest) {
 	ifaces := getSniffInterfaces()
 	if len(ifaces) == 0 {
-		log.Printf("[SNIFFER] contest %d: no usable interfaces — sniffing disabled", contest.ID)
+		log.Printf("[SNIFFER] contest %s: no usable interfaces — sniffing disabled", contest.ID)
 		return
 	}
 
-	ctx, cancel := context.WithDeadline(context.Background(), contest.EndTime)
+	sctx, cancel := context.WithDeadline(context.Background(), contest.EndTime)
 
 	snifferCancelsMu.Lock()
 	if existing, ok := snifferCancels[contest.ID]; ok {
@@ -479,21 +507,21 @@ func startSniffer(contest Contest) {
 	snifferCancels[contest.ID] = cancel
 	snifferCancelsMu.Unlock()
 
-	log.Printf("[SNIFFER] contest %d: starting on %s", contest.ID, strings.Join(ifaces, ", "))
+	log.Printf("[SNIFFER] contest %s: starting on %s", contest.ID, strings.Join(ifaces, ", "))
 	for _, iface := range ifaces {
-		go sniffInterface(ctx, iface, contest)
+		go sniffInterface(sctx, iface, contest)
 	}
 
 	go func() {
-		<-ctx.Done()
+		<-sctx.Done()
 		snifferCancelsMu.Lock()
 		delete(snifferCancels, contest.ID)
 		snifferCancelsMu.Unlock()
-		log.Printf("[SNIFFER] contest %d: all sniffers stopped", contest.ID)
+		log.Printf("[SNIFFER] contest %s: all sniffers stopped", contest.ID)
 	}()
 }
 
-func stopSniffer(contestID uint) {
+func stopSniffer(contestID string) {
 	snifferCancelsMu.Lock()
 	defer snifferCancelsMu.Unlock()
 	if cancel, ok := snifferCancels[contestID]; ok {
@@ -502,7 +530,7 @@ func stopSniffer(contestID uint) {
 	}
 }
 
-func sniffInterface(ctx context.Context, iface string, contest Contest) {
+func sniffInterface(sctx context.Context, iface string, contest Contest) {
 	handle, err := pcap.OpenLive(iface, 65535, true, 500*time.Millisecond)
 	if err != nil {
 		log.Printf("[SNIFFER] [%s] open error: %v", iface, err)
@@ -516,7 +544,7 @@ func sniffInterface(ctx context.Context, iface string, contest Contest) {
 		return
 	}
 
-	log.Printf("[SNIFFER] [%s] listening — contest %d (%s → %s BST)",
+	log.Printf("[SNIFFER] [%s] listening — contest %s (%s → %s BST)",
 		iface, contest.ID,
 		fmtBST(contest.StartTime),
 		fmtBST(contest.EndTime),
@@ -528,8 +556,8 @@ func sniffInterface(ctx context.Context, iface string, contest Contest) {
 
 	for {
 		select {
-		case <-ctx.Done():
-			log.Printf("[SNIFFER] [%s] contest %d: context cancelled — stopping", iface, contest.ID)
+		case <-sctx.Done():
+			log.Printf("[SNIFFER] [%s] contest %s: context cancelled — stopping", iface, contest.ID)
 			return
 		case pkt, ok := <-src.Packets():
 			if !ok {
@@ -584,44 +612,57 @@ func sniffInterface(ctx context.Context, iface string, contest Contest) {
 }
 
 // ── Hit recording ─────────────────────────────────────────────────────────────
-
 func recordHit(contest Contest, srcIP, domain string) {
-	// Store UTC timestamps in DB (consistent with loc=UTC DSN).
-	tlQ := fmt.Sprintf(
-		"INSERT INTO `%s` (ip, ai_service, timestamp) VALUES (?, ?, UTC_TIMESTAMP(3))",
-		contest.TrafficLogsTable,
-	)
-	if _, err := sqlDB.Exec(tlQ, srcIP, domain); err != nil {
+	now := time.Now().UTC()
+	contestRef := rtdb.NewRef("contests/" + contest.ID)
+
+	// Traffic log — append-only history of every AI-domain packet seen.
+	if _, err := contestRef.Child("traffic_logs").Push(ctx, TrafficLog{
+		IP:        srcIP,
+		AIService: domain,
+		Timestamp: now,
+	}); err != nil {
 		log.Printf("[SNIFFER] traffic_logs insert error: %v", err)
 	}
 
-	// Deduped ai_hits — skip if same IP+domain hit within last 10 minutes.
-	ahQ := fmt.Sprintf(`
-		INSERT INTO `+"`%s`"+` (contest_id, ip, domain, created_at)
-		SELECT ?, ?, ?, UTC_TIMESTAMP(3)
-		WHERE NOT EXISTS (
-			SELECT 1 FROM `+"`%s`"+`
-			WHERE ip = ? AND domain = ?
-			  AND created_at >= UTC_TIMESTAMP(3) - INTERVAL 10 MINUTE
-		)`,
-		contest.AIHitsTable, contest.AIHitsTable,
-	)
-	if _, err := sqlDB.Exec(ahQ, contest.ID, srcIP, domain, srcIP, domain); err != nil {
-		log.Printf("[SNIFFER] ai_hits insert error: %v", err)
+	// Deduped ai_hits — skip if the same IP+domain hit within the last 10 minutes.
+	ahRef := contestRef.Child("ai_hits")
+	var recent map[string]AIHit
+	if err := ahRef.OrderByChild("ip").EqualTo(srcIP).Get(ctx, &recent); err != nil {
+		log.Printf("[SNIFFER] ai_hits query error: %v", err)
+	}
+	dup := false
+	for _, h := range recent {
+		if h.Domain == domain && now.Sub(h.CreatedAt) < 10*time.Minute {
+			dup = true
+			break
+		}
+	}
+	if !dup {
+		if _, err := ahRef.Push(ctx, AIHit{IP: srcIP, Domain: domain, CreatedAt: now}); err != nil {
+			log.Printf("[SNIFFER] ai_hits insert error: %v", err)
+		}
 	}
 
-	// Flag the participant.
-	updQ := fmt.Sprintf(
-		"UPDATE `%s` SET ai_violation = 1, last_seen = UTC_TIMESTAMP() WHERE ip = ?",
-		contest.TableName,
-	)
-	res, err := sqlDB.Exec(updQ, srcIP)
-	if err != nil {
+	// Flag the participant (only if they exist in the roster for this contest).
+	pRef := contestRef.Child("participants").Child(sanitizeKey(srcIP))
+	var existing Participant
+	if err := pRef.Get(ctx, &existing); err != nil {
+		log.Printf("[SNIFFER] participant lookup error: %v", err)
+		return
+	}
+	if existing.IP == "" {
+		log.Printf("[SNIFFER] domain=%-20s  src=%-18s  contest=%s  rows_updated=0 (unknown participant)", domain, srcIP, contest.ID)
+		return
+	}
+	if err := pRef.Update(ctx, map[string]interface{}{
+		"ai_violation": true,
+		"last_seen":    now,
+	}); err != nil {
 		log.Printf("[SNIFFER] participant update error: %v", err)
 		return
 	}
-	affected, _ := res.RowsAffected()
-	log.Printf("[SNIFFER] domain=%-20s  src=%-18s  rows_updated=%d", domain, srcIP, affected)
+	log.Printf("[SNIFFER] domain=%-20s  src=%-18s  contest=%s  rows_updated=1", domain, srcIP, contest.ID)
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -677,27 +718,6 @@ func hostContest(c *gin.Context) {
 		return
 	}
 
-	ts := time.Now().UnixNano()
-	participantTable := fmt.Sprintf("contest_%d", ts)
-	trafficTable := fmt.Sprintf("traffic_logs_%d", ts)
-	aiHitsTable := fmt.Sprintf("ai_hits_%d", ts)
-
-	if err := createParticipantsTable(participantTable); err != nil {
-		log.Printf("[HOST] create participants table error: %v", err)
-		c.JSON(500, gin.H{"error": "failed to create participant table"})
-		return
-	}
-	if err := createTrafficLogsTable(trafficTable); err != nil {
-		log.Printf("[HOST] create traffic table error: %v", err)
-		c.JSON(500, gin.H{"error": "failed to create traffic table"})
-		return
-	}
-	if err := createAIHitsTable(aiHitsTable); err != nil {
-		log.Printf("[HOST] create ai_hits table error: %v", err)
-		c.JSON(500, gin.H{"error": "failed to create ai_hits table"})
-		return
-	}
-
 	f, err := file.Open()
 	if err != nil {
 		c.JSON(400, gin.H{"error": "failed to open uploaded file"})
@@ -711,7 +731,7 @@ func hostContest(c *gin.Context) {
 		return
 	}
 
-	insertQ := fmt.Sprintf("INSERT INTO `%s` (team_name, ip, members) VALUES (?, ?, ?)", participantTable)
+	participants := make(map[string]Participant)
 	for i := 1; i < len(records); i++ {
 		row := records[i]
 		if len(row) < 2 {
@@ -723,24 +743,42 @@ func hostContest(c *gin.Context) {
 		if len(row) > 2 {
 			members = strings.Join(row[2:], ", ")
 		}
-		if _, err := sqlDB.Exec(insertQ, teamName, ip, members); err != nil {
-			log.Printf("[HOST] insert participant error (row %d): %v", i, err)
+		participants[sanitizeKey(ip)] = Participant{
+			TeamName:    teamName,
+			IP:          ip,
+			Members:     members,
+			AIViolation: false,
 		}
 	}
 
-	endTime := startTime.Add(durationMin)
-	contest := Contest{
-		Name:             name,
-		StartTime:        startTime,
-		EndTime:          endTime,
-		TableName:        participantTable,
-		TrafficLogsTable: trafficTable,
-		AIHitsTable:      aiHitsTable,
-	}
-	if err := db.Create(&contest).Error; err != nil {
-		log.Printf("[HOST] create contest record error: %v", err)
+	// Reserve a new contest ID (Firebase push key — chronologically sortable).
+	newRef, err := rtdb.NewRef("contests").Push(ctx, nil)
+	if err != nil {
+		log.Printf("[HOST] create contest key error: %v", err)
 		c.JSON(500, gin.H{"error": "failed to create contest"})
 		return
+	}
+	contestID := newRef.Key
+
+	endTime := startTime.Add(durationMin)
+	contest := Contest{
+		ID:        contestID,
+		Name:      name,
+		StartTime: startTime,
+		EndTime:   endTime,
+	}
+
+	if err := newRef.Set(ctx, contest); err != nil {
+		log.Printf("[HOST] write contest error: %v", err)
+		c.JSON(500, gin.H{"error": "failed to create contest"})
+		return
+	}
+	if len(participants) > 0 {
+		if err := newRef.Child("participants").Set(ctx, participants); err != nil {
+			log.Printf("[HOST] write participants error: %v", err)
+			c.JSON(500, gin.H{"error": "failed to store participants"})
+			return
+		}
 	}
 
 	go startSniffer(contest)
@@ -748,60 +786,55 @@ func hostContest(c *gin.Context) {
 }
 
 func deleteContest(c *gin.Context) {
+	id := c.Param("id")
 	var contest Contest
-	if err := db.First(&contest, c.Param("id")).Error; err != nil {
+	if err := rtdb.NewRef("contests/"+id).Get(ctx, &contest); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if contest.Name == "" {
 		c.JSON(404, gin.H{"error": "contest not found"})
 		return
 	}
-	stopSniffer(contest.ID)
-	for _, tbl := range []string{contest.TableName, contest.TrafficLogsTable, contest.AIHitsTable} {
-		if tbl == "" {
-			continue
-		}
-		if _, err := sqlDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS `%s`", tbl)); err != nil {
-			log.Printf("[DELETE] drop table %q error: %v", tbl, err)
-		}
+	stopSniffer(id)
+	if err := rtdb.NewRef("contests/" + id).Delete(ctx); err != nil {
+		log.Printf("[DELETE] contest %s error: %v", id, err)
+		c.JSON(500, gin.H{"error": "failed to delete contest"})
+		return
 	}
-	db.Delete(&contest)
 	c.JSON(200, gin.H{"status": "deleted"})
 }
 
 func monitorTelemetry(c *gin.Context) {
+	id := c.Param("id")
+
 	var contest Contest
-	if err := db.First(&contest, c.Param("id")).Error; err != nil {
+	if err := rtdb.NewRef("contests/"+id).Get(ctx, &contest); err != nil || contest.Name == "" {
 		c.JSON(404, gin.H{"error": "contest not found"})
 		return
 	}
 
-	q := fmt.Sprintf(
-		"SELECT team_name, members, ip, CAST(ai_violation AS UNSIGNED), last_seen FROM `%s`",
-		contest.TableName,
-	)
-	rows, err := sqlDB.Query(q)
-	if err != nil {
+	var participants map[string]Participant
+	if err := rtdb.NewRef("contests/"+id+"/participants").Get(ctx, &participants); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	defer rows.Close()
 
-	statuses := make([]TeamStatus, 0)
-	for rows.Next() {
-		var s TeamStatus
-		var v int
-		var ls sql.NullTime
-		if err := rows.Scan(&s.Name, &s.Members, &s.IP, &v, &ls); err != nil {
-			log.Printf("[MONITOR] scan error: %v", err)
-			continue
+	statuses := make([]TeamStatus, 0, len(participants))
+	for _, p := range participants {
+		s := TeamStatus{
+			Name:      p.TeamName,
+			Members:   p.Members,
+			IP:        p.IP,
+			IsWarning: p.AIViolation,
 		}
-		s.IsWarning = v != 0
 		s.AIStatus = "CLEAN"
 		if s.IsWarning {
 			s.AIStatus = "AI SITE DETECTED"
 		}
 		s.LastSeen = "Never"
-		if ls.Valid {
-			// DB stores UTC; display in BST.
-			s.LastSeen = fmtBST(ls.Time)
+		if !p.LastSeen.IsZero() {
+			s.LastSeen = fmtBST(p.LastSeen)
 		}
 		statuses = append(statuses, s)
 	}
@@ -809,102 +842,101 @@ func monitorTelemetry(c *gin.Context) {
 }
 
 func getViolations(c *gin.Context) {
+	id := c.Param("id")
+
 	var contest Contest
-	if err := db.First(&contest, c.Param("id")).Error; err != nil {
+	if err := rtdb.NewRef("contests/"+id).Get(ctx, &contest); err != nil || contest.Name == "" {
 		c.JSON(404, gin.H{"error": "contest not found"})
 		return
 	}
 
-	q := fmt.Sprintf(`
-		SELECT p.team_name, p.members, p.ip, p.last_seen,
-		       COALESCE((
-		           SELECT ah.domain FROM `+"`%s`"+` ah
-		           WHERE ah.ip = p.ip
-		           ORDER BY ah.created_at DESC LIMIT 1
-		       ), '') AS domain
-		FROM `+"`%s`"+` p
-		WHERE p.ai_violation = 1`,
-		contest.AIHitsTable,
-		contest.TableName,
-	)
-	rows, err := sqlDB.Query(q)
-	if err != nil {
+	var participants map[string]Participant
+	if err := rtdb.NewRef("contests/"+id+"/participants").Get(ctx, &participants); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	defer rows.Close()
 
 	violations := make([]ViolationTeam, 0)
-	for rows.Next() {
-		var teamName, membersRaw, ip, domain string
-		var ls sql.NullTime
-		if err := rows.Scan(&teamName, &membersRaw, &ip, &ls, &domain); err != nil {
-			log.Printf("[VIOLATIONS] scan error: %v", err)
+	for _, p := range participants {
+		if !p.AIViolation {
 			continue
 		}
 		detectedAt := "Unknown"
-		if ls.Valid {
-			detectedAt = fmtBST(ls.Time)
+		if !p.LastSeen.IsZero() {
+			detectedAt = fmtBST(p.LastSeen)
 		}
 		violations = append(violations, ViolationTeam{
-			TeamName:   teamName,
-			Members:    splitMembers(membersRaw),
-			IP:         ip,
+			TeamName:   p.TeamName,
+			Members:    splitMembers(p.Members),
+			IP:         p.IP,
 			DetectedAt: detectedAt,
-			Domain:     domain,
+			Domain:     latestDomainForIP(id, p.IP),
 		})
 	}
 	c.JSON(200, violations)
 }
 
+
+func latestDomainForIP(contestID, ip string) string {
+	var hits map[string]AIHit
+	if err := rtdb.NewRef("contests/"+contestID+"/ai_hits").OrderByChild("ip").EqualTo(ip).Get(ctx, &hits); err != nil {
+		log.Printf("[VIOLATIONS] ai_hits query error: %v", err)
+		return ""
+	}
+	var latest AIHit
+	for _, h := range hits {
+		if h.CreatedAt.After(latest.CreatedAt) {
+			latest = h
+		}
+	}
+	return latest.Domain
+}
+
 func getAIHits(c *gin.Context) {
+	id := c.Param("id")
+
 	var contest Contest
-	if err := db.First(&contest, c.Param("id")).Error; err != nil {
+	if err := rtdb.NewRef("contests/"+id).Get(ctx, &contest); err != nil || contest.Name == "" {
 		c.JSON(404, gin.H{"error": "contest not found"})
 		return
 	}
 
-	q := fmt.Sprintf(`
-		SELECT ah.ip, p.team_name, p.members, ah.domain, ah.created_at
-		FROM `+"`%s`"+` ah
-		LEFT JOIN `+"`%s`"+` p ON p.ip = ah.ip
-		ORDER BY ah.created_at DESC`,
-		contest.AIHitsTable,
-		contest.TableName,
-	)
-	rows, err := sqlDB.Query(q)
-	if err != nil {
+	var hitsMap map[string]AIHit
+	if err := rtdb.NewRef("contests/"+id+"/ai_hits").Get(ctx, &hitsMap); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	defer rows.Close()
+	var participants map[string]Participant
+	rtdb.NewRef("contests/" + id + "/participants").Get(ctx, &participants) // best-effort join
 
-	hits := make([]AIHitDetail, 0)
-	for rows.Next() {
-		var ip, domain string
-		var teamName, membersRaw sql.NullString
-		var createdAt sql.NullTime
-		if err := rows.Scan(&ip, &teamName, &membersRaw, &domain, &createdAt); err != nil {
-			log.Printf("[AI-HITS] scan error: %v", err)
-			continue
+	byIP := make(map[string]Participant, len(participants))
+	for _, p := range participants {
+		byIP[p.IP] = p
+	}
+
+	ordered := make([]AIHit, 0, len(hitsMap))
+	for _, h := range hitsMap {
+		ordered = append(ordered, h)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].CreatedAt.After(ordered[j].CreatedAt) })
+
+	hits := make([]AIHitDetail, 0, len(ordered))
+	for _, h := range ordered {
+		team := "Unknown"
+		members := make([]string, 0)
+		if p, ok := byIP[h.IP]; ok {
+			team = p.TeamName
+			members = splitMembers(p.Members)
 		}
 		hitTime := "Unknown"
-		if createdAt.Valid {
-			hitTime = fmtBST(createdAt.Time)
-		}
-		team := "Unknown"
-		if teamName.Valid {
-			team = teamName.String
-		}
-		members := make([]string, 0)
-		if membersRaw.Valid {
-			members = splitMembers(membersRaw.String)
+		if !h.CreatedAt.IsZero() {
+			hitTime = fmtBST(h.CreatedAt)
 		}
 		hits = append(hits, AIHitDetail{
-			IP:       ip,
+			IP:       h.IP,
 			TeamName: team,
 			Members:  members,
-			Domain:   domain,
+			Domain:   h.Domain,
 			HitTime:  hitTime,
 		})
 	}
@@ -912,11 +944,17 @@ func getAIHits(c *gin.Context) {
 }
 
 func getContests(c *gin.Context) {
-	var list []Contest
-	if err := db.Find(&list).Error; err != nil {
+	var contestsMap map[string]Contest
+	if err := rtdb.NewRef("contests").Get(ctx, &contestsMap); err != nil {
 		c.JSON(500, gin.H{"error": "failed to fetch contests"})
 		return
 	}
+	list := make([]Contest, 0, len(contestsMap))
+	for id, ct := range contestsMap {
+		ct.ID = id
+		list = append(list, ct)
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].StartTime.After(list[j].StartTime) })
 	c.JSON(200, list)
 }
 
@@ -944,23 +982,46 @@ func register(c *gin.Context) {
 		return
 	}
 
+	emailKey := sanitizeKey(in.Email)
+	emailRef := rtdb.NewRef("users_by_email/" + emailKey)
+
+	var existingUID string
+	if err := emailRef.Get(ctx, &existingUID); err == nil && existingUID != "" {
+		c.JSON(409, gin.H{"error": "email already registered"})
+		return
+	}
+
 	pw, err := bcrypt.GenerateFromPassword([]byte(in.Password), 10)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "failed to hash password"})
 		return
 	}
-	if err := db.Create(&User{
-		Name:     strings.TrimSpace(in.FirstName + " " + in.LastName),
-		Email:    in.Email,
-		Password: string(pw),
-	}).Error; err != nil {
-		if strings.Contains(err.Error(), "Duplicate") {
-			c.JSON(409, gin.H{"error": "email already registered"})
-			return
-		}
+
+	usersRef := rtdb.NewRef("users")
+	newRef, err := usersRef.Push(ctx, nil)
+	if err != nil {
+		log.Printf("[REGISTER] create user key error: %v", err)
 		c.JSON(500, gin.H{"error": "failed to create user"})
 		return
 	}
+
+	user := User{
+		ID:       newRef.Key,
+		Name:     strings.TrimSpace(in.FirstName + " " + in.LastName),
+		Email:    in.Email,
+		Password: string(pw),
+	}
+	if err := newRef.Set(ctx, user); err != nil {
+		log.Printf("[REGISTER] write user error: %v", err)
+		c.JSON(500, gin.H{"error": "failed to create user"})
+		return
+	}
+	if err := emailRef.Set(ctx, newRef.Key); err != nil {
+		log.Printf("[REGISTER] write email index error: %v", err)
+		c.JSON(500, gin.H{"error": "failed to create user"})
+		return
+	}
+
 	c.JSON(200, gin.H{"message": "success"})
 }
 
@@ -973,17 +1034,33 @@ func login(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid request body"})
 		return
 	}
+
+	emailKey := sanitizeKey(strings.TrimSpace(strings.ToLower(in.Email)))
+
+	var uid string
+	if err := rtdb.NewRef("users_by_email/"+emailKey).Get(ctx, &uid); err != nil || uid == "" {
+		c.JSON(401, gin.H{"error": "invalid email or password"})
+		return
+	}
+
 	var u User
-	if err := db.Where("email = ?", strings.TrimSpace(strings.ToLower(in.Email))).First(&u).Error; err == nil {
+	if err := rtdb.NewRef("users/"+uid).Get(ctx, &u); err == nil && u.Password != "" {
 		if err := bcrypt.CompareHashAndPassword([]byte(u.Password), []byte(in.Password)); err == nil {
 			token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 				"user_id": u.ID,
 				"exp":     time.Now().Add(24 * time.Hour).Unix(),
 			})
-			t, _ := token.SignedString(jwtSecret)
-			c.JSON(200, gin.H{"token": t, "user": u})
+			t, signErr := token.SignedString(jwtSecret)
+			if signErr != nil {
+				c.JSON(500, gin.H{"error": "failed to issue token"})
+				return
+			}
+			c.JSON(200, gin.H{"token": t, "user": u.sanitizedForClient()})
 			return
 		}
 	}
 	c.JSON(401, gin.H{"error": "invalid email or password"})
 }
+
+// silence "declared and not used" if nowBST is ever trimmed by editors
+var _ = nowBST
