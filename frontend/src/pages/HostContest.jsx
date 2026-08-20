@@ -4,10 +4,9 @@ import {
   FaTrophy, FaCalendarAlt, FaHourglassHalf, FaFileCsv,
   FaUpload, FaCheckCircle, FaExclamationCircle, FaClock,
 } from "react-icons/fa";
-import { getUser } from "../api";
+import { apiPostForm, getUser } from "../api";
 import styles from "./HostContest.module.css";
 
-const API         = import.meta.env.VITE_API_URL;
 const MAX_DURATION = 300; // minutes
 
 // Pad number to 2 digits
@@ -18,8 +17,7 @@ const HostContest = () => {
   const today = new Date().toISOString().split("T")[0];
 
   useEffect(() => {
-    const isAdminVerified = localStorage.getItem("adminVerified") === "true";
-    if (getUser()?.role !== "admin" || !isAdminVerified) {
+    if (getUser()?.role !== "admin") {
       navigate("/dashboard");
     }
   }, [navigate]);
@@ -31,6 +29,7 @@ const HostContest = () => {
   const [ampm, setAmpm]               = useState("AM");
   const [duration, setDuration]       = useState("120");
   const [csvFile, setCsvFile]         = useState(null);
+  const [consent, setConsent]         = useState(false);
   const [status, setStatus]           = useState({ loading: false, message: "", type: "" });
 
   const hours   = Array.from({ length: 12 }, (_, i) => pad(i + 1));
@@ -71,14 +70,14 @@ const HostContest = () => {
     e.preventDefault();
     if (!date)    return setStatus({ loading: false, message: "Select a contest date.", type: "error" });
     if (!csvFile) return setStatus({ loading: false, message: "Upload the team roster (.csv).", type: "error" });
+    if (!consent) return setStatus({ loading: false, message: "Confirm that all participants were informed and consented to authorized network metadata monitoring.", type: "error" });
 
     const dur = parseInt(duration, 10);
     if (isNaN(dur) || dur < 1 || dur > MAX_DURATION) {
       return setStatus({ loading: false, message: `Duration must be 1–${MAX_DURATION} min.`, type: "error" });
     }
 
-    const token = localStorage.getItem("token");
-    if (!token) return setStatus({ loading: false, message: "Not logged in. Please login first.", type: "error" });
+    if (!localStorage.getItem("token")) return setStatus({ loading: false, message: "Not logged in. Please login first.", type: "error" });
 
     setStatus({ loading: true, message: "Deploying contest...", type: "" });
 
@@ -87,19 +86,16 @@ const HostContest = () => {
     data.append("contestTime", buildContestTime());
     data.append("duration", String(dur));
     data.append("file", csvFile);
+    data.append("captureConsent", "true");
 
     try {
-      const res  = await fetch(`${API}/host-contest`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-        body: data,
-      });
+      const res = await apiPostForm("/host-contest", data);
       const json = await res.json().catch(() => null);
 
       if (res.ok) {
         setStatus({ loading: false, message: "Contest deployed successfully!", type: "success" });
         setContestName(""); setDate(""); setHour("12"); setMinute("00");
-        setAmpm("AM"); setDuration("120"); setCsvFile(null);
+        setAmpm("AM"); setDuration("120"); setCsvFile(null); setConsent(false);
         const fi = document.getElementById("csv-upload");
         if (fi) fi.value = "";
       } else {
@@ -211,6 +207,11 @@ const HostContest = () => {
             </label>
             <input id="csv-upload" type="file" accept=".csv" hidden onChange={handleFileChange} />
           </div>
+
+          <label className={styles.consentRow}>
+            <input type="checkbox" checked={consent} onChange={(e) => setConsent(e.target.checked)} />
+            <span>I confirm that this contest has informed participant consent for authorized network metadata monitoring. The detector records domain/IP signals only; a match is not conclusive proof of AI use.</span>
+          </label>
 
           {/* Submit */}
           <button className={styles.btn} type="submit" disabled={status.loading}>

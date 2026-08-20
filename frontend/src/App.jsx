@@ -3,6 +3,7 @@ import Navbar from "./components/Navbar";
 import Home from "./pages/Home";
 import Dashboard from "./pages/Dashboard";
 import MonitorContest from "./pages/MonitorContest";
+import PublicViolations from "./pages/PublicViolations";
 import Login from "./pages/Login";
 import Register from "./pages/Register";
 import About from "./pages/About";
@@ -28,8 +29,9 @@ const App = () => {
 
         {/* Protected — require login */}
         <Route path="/dashboard"       element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
-        <Route path="/monitor-contest" element={<ProtectedRoute><MonitorContest /></ProtectedRoute>} />
-        <Route path="/host-contest"    element={<ProtectedRoute><HostContest /></ProtectedRoute>} />
+        <Route path="/violations"     element={<ProtectedRoute><PublicViolations /></ProtectedRoute>} />
+        <Route path="/monitor-contest" element={<AdminRoute><MonitorContest /></AdminRoute>} />
+        <Route path="/host-contest"    element={<AdminRoute><HostContest /></AdminRoute>} />
 
         {/* Admin-only — 403 for anonymous or non-admin users */}
         <Route path="/admin" element={<AdminRoute><Admin /></AdminRoute>} />

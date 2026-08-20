@@ -41,10 +41,6 @@ const Admin = () => {
 
       localStorage.setItem("token", data.token);
       localStorage.setItem("user", JSON.stringify(data.user));
-      // Marks that this admin actually authenticated through the /admin
-      // login form (not just a regular /login with an admin-role account).
-      // Nav items like "Host Contest" check this flag, not just role.
-      localStorage.setItem("adminVerified", "true");
       window.dispatchEvent(new Event("authChange"));
       navigate("/dashboard");
     } catch {

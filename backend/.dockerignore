@@ -1,0 +1,6 @@
+firebase_credentials.json
+*.pem
+*.key
+main
+.git
+*.log

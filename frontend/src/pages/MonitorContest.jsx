@@ -5,23 +5,17 @@ import {
   FaSatellite, FaGlobe, FaClock, FaWifi, FaSkull, FaBan,
   FaIdBadge, FaDatabase, FaFire, FaArrowLeft,
 } from "react-icons/fa";
+import { apiGet, isLoggedIn } from "../api";
 import styles from "./MonitorContest.module.css";
 
-const API           = import.meta.env.VITE_API_URL;
 const POLL_INTERVAL = 3000;
 
-function getAuthHeader(navigate) {
-  const token = localStorage.getItem("token");
-  if (!token) { navigate("/login"); return null; }
-  return { Authorization: `Bearer ${token}` };
-}
-
-async function apiFetch(url, headers) {
+async function fetchJson(path) {
   try {
-    const res = await fetch(url, { cache: "no-store", headers });
-    if (res.status === 401) return { unauthorized: true };
-    if (!res.ok) return null;
-    return await res.json();
+    const response = await apiGet(path);
+    if (response.status === 401) return { unauthorized: true };
+    if (!response.ok) return null;
+    return await response.json();
   } catch {
     return null;
   }
@@ -36,7 +30,7 @@ const MonitorContest = () => {
   const [error, setError]           = useState(null);
   const [lastSync, setLastSync]     = useState(null);
   const [contests, setContests]     = useState([]);
-  const [pickerLoading, setPickerLoading] = useState(false);
+  const [pickerLoading, setPickerLoading] = useState(true);
 
   const intervalRef    = useRef(null);
   const prevViolations = useRef(0);
@@ -61,10 +55,11 @@ const MonitorContest = () => {
   // ── Contest picker (no id in URL) ─────────────────────────────────────────
   useEffect(() => {
     if (contestId) return;
-    const hdrs = getAuthHeader(navigate);
-    if (!hdrs) return;
-    setPickerLoading(true);
-    apiFetch(`${API}/contests`, hdrs)
+    if (!isLoggedIn()) {
+      navigate("/login");
+      return;
+    }
+    fetchJson("/contests")
       .then((data) => {
         if (data?.unauthorized) { navigate("/login"); return; }
         setContests(Array.isArray(data) ? data : []);
@@ -75,14 +70,16 @@ const MonitorContest = () => {
   // ── Polling ───────────────────────────────────────────────────────────────
   const poll = useCallback(async () => {
     if (!contestId) return;
-    const hdrs = getAuthHeader(navigate);
-    if (!hdrs) return;
+    if (!isLoggedIn()) {
+      navigate("/login");
+      return;
+    }
 
-    // Fire all three requests in parallel
+    // Fire all three requests in parallel.
     const [teamsData, violData, hitsData] = await Promise.all([
-      apiFetch(`${API}/contests/${contestId}/monitor`, hdrs),
-      apiFetch(`${API}/contests/${contestId}/violations`, hdrs),
-      apiFetch(`${API}/contests/${contestId}/ai-hits`, hdrs),
+      fetchJson(`/contests/${contestId}/monitor`),
+      fetchJson(`/contests/${contestId}/violations`),
+      fetchJson(`/contests/${contestId}/ai-hits`),
     ]);
 
     if (teamsData?.unauthorized || violData?.unauthorized || hitsData?.unauthorized) {
@@ -114,16 +111,18 @@ const MonitorContest = () => {
   }, [contestId, navigate, playAlert]);
 
   useEffect(() => {
-    if (!contestId) return;
-    poll();
-    intervalRef.current = setInterval(poll, POLL_INTERVAL);
-    return () => clearInterval(intervalRef.current);
+    if (!contestId) return undefined;
+    const firstPoll = window.setTimeout(() => { void poll(); }, 0);
+    intervalRef.current = window.setInterval(() => { void poll(); }, POLL_INTERVAL);
+    return () => {
+      window.clearTimeout(firstPoll);
+      window.clearInterval(intervalRef.current);
+    };
   }, [contestId, poll]);
 
   const syncLabel = lastSync
     ? lastSync.toLocaleTimeString("en-BD", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
     : "---";
-
   const violationCount = teams.filter((t) => t.is_warning === true || t.is_warning === 1).length;
 
   /* ── Contest picker ── */
@@ -179,7 +178,8 @@ const MonitorContest = () => {
           <div>
             <h1 className={styles.title}>Live Contest Monitor<span className={styles.cursor}>_</span></h1>
             <p className={styles.subtext}>
-              Teams:&nbsp;<span className={styles.count}>{teams.length}</span>
+              Teams:&nbsp;              <span className={styles.count}>{teams.length}</span>
+              &ensp;|&ensp;Last sync:&nbsp;<span className={styles.count}>{syncLabel} BST</span>
               &ensp;|&ensp;Violations:&nbsp;
               <span className={violationCount > 0 ? styles.danger : styles.count}>{violationCount}</span>
               &ensp;|&ensp;AI Hits:&nbsp;

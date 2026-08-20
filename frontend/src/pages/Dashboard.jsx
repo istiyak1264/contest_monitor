@@ -4,15 +4,15 @@ import {
   FaTrophy, FaClock, FaTerminal, FaTrashAlt,
   FaExclamationTriangle, FaCheck, FaTimes, FaSatellite,
 } from "react-icons/fa";
-import { getUser } from "../api";
+import { apiDelete, apiGet, getUser } from "../api";
 import styles from "./Dashboard.module.css";
 
-const API = import.meta.env.VITE_API_URL;
-
-function authHeaders(navigate) {
-  const token = localStorage.getItem("token");
-  if (!token) { navigate("/login"); return null; }
-  return { Authorization: `Bearer ${token}` };
+function ensureSession(navigate) {
+  if (!localStorage.getItem("token")) {
+    navigate("/login");
+    return false;
+  }
+  return true;
 }
 
 /** Format a millisecond diff into HH:MM:SS */
@@ -32,14 +32,14 @@ const Dashboard = () => {
   const isAdmin  = getUser()?.role === "admin";
 
   const fetchContests = useCallback(async () => {
-    const hdrs = authHeaders(navigate);
-    if (!hdrs) return;
+    if (!ensureSession(navigate)) return;
     try {
-      const res = await fetch(`${API}/contests`, { headers: hdrs });
-      if (res.status === 401) { navigate("/login"); return; }
+      const res = await apiGet("/contests");
       if (res.ok) {
         const data = await res.json();
         setContests(Array.isArray(data) ? data : []);
+      } else if (res.status !== 401) {
+        throw new Error(`Contest list request failed with ${res.status}`);
       }
     } catch (err) {
       console.error("Sync Error:", err);
@@ -68,13 +68,14 @@ const Dashboard = () => {
   }, [contests]);
 
   const confirmDelete = async (id) => {
-    const hdrs = authHeaders(navigate);
-    if (!hdrs) return;
+    if (!ensureSession(navigate)) return;
     try {
-      const res = await fetch(`${API}/contests/${id}`, { method: "DELETE", headers: hdrs });
+      const res = await apiDelete(`/contests/${id}`);
       if (res.ok) {
         setContests((prev) => prev.filter((c) => c.id !== id));
         setDeletingId(null);
+      } else if (res.status !== 401) {
+        throw new Error(`Contest deletion failed with ${res.status}`);
       }
     } catch (err) {
       console.error("Delete Error:", err);
@@ -134,11 +135,20 @@ const Dashboard = () => {
                     <div className={styles.cardActions}>
                       <button
                         className={styles.manageBtn}
-                        onClick={() => navigate(`/monitor-contest?id=${contest.id}`)}
+                        onClick={() => navigate(`/violations?id=${contest.id}`)}
                       >
-                        <FaSatellite style={{ marginRight: 8 }} />
-                        &gt;&nbsp;Open Telemetry
+                        <FaExclamationTriangle style={{ marginRight: 8 }} />
+                        &gt;&nbsp;Shared Violations
                       </button>
+                      {isAdmin && (
+                        <button
+                          className={styles.manageBtn}
+                          onClick={() => navigate(`/monitor-contest?id=${contest.id}`)}
+                        >
+                          <FaSatellite style={{ marginRight: 8 }} />
+                          &gt;&nbsp;Open Telemetry
+                        </button>
+                      )}
                     </div>
                   </>
                 ) : (

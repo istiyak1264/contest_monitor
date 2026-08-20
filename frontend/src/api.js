@@ -1,43 +1,61 @@
-const BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8081";
+const BASE_URL = (import.meta.env.VITE_API_URL || "/api").replace(/\/$/, "");
+const REQUEST_TIMEOUT_MS = 15_000;
+
+function buildUrl(path) {
+  return `${BASE_URL}/${String(path).replace(/^\//, "")}`;
+}
 
 export async function apiFetch(path, options = {}) {
   const token = localStorage.getItem("token");
-
-  const headers = { ...(options.headers || {}) };
+  const headers = new Headers(options.headers || {});
 
   if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
+    headers.set("Authorization", `Bearer ${token}`);
   }
 
-  // Only set Content-Type to JSON if we're NOT sending FormData
-  if (!(options.body instanceof FormData)) {
-    headers["Content-Type"] = headers["Content-Type"] || "application/json";
+  if (options.body != null && !(options.body instanceof FormData) && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
   }
 
-  let response;
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const externalSignal = options.signal;
+  const abortExternal = () => controller.abort();
+  externalSignal?.addEventListener("abort", abortExternal, { once: true });
+
   try {
-    response = await fetch(`${BASE}${path}`, { ...options, headers });
-  } catch (err) {
-    // Network error (backend is down, CORS blocked before response, etc.)
-    throw new Error("Cannot connect to server. Check if Go backend is running.");
+    return await fetch(buildUrl(path), {
+      ...options,
+      headers,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("Request timed out. Check the server and local network connection.");
+    }
+    throw new Error("Cannot connect to the server. Check that the contest monitor is running on this network.");
+  } finally {
+    window.clearTimeout(timeoutId);
+    externalSignal?.removeEventListener("abort", abortExternal);
   }
-
-  // Auto-logout on 401
-  if (response.status === 401) {
-    localStorage.removeItem("token");
-    localStorage.removeItem("user");
-    localStorage.removeItem("adminVerified");
-    window.dispatchEvent(new Event("authChange"));
-    window.location.href = "/login";
-    return response;
-  }
-
-  return response;
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+async function readJson(response) {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
 
-/** POST JSON */
+export async function apiJson(path, options = {}) {
+  const response = await apiFetch(path, options);
+  if (response.status === 401) {
+    logout();
+  }
+  return { response, data: await readJson(response) };
+}
+
 export async function apiPost(path, body) {
   return apiFetch(path, {
     method: "POST",
@@ -45,7 +63,6 @@ export async function apiPost(path, body) {
   });
 }
 
-/** POST FormData (file uploads, multipart forms) */
 export async function apiPostForm(path, formData) {
   return apiFetch(path, {
     method: "POST",
@@ -53,19 +70,14 @@ export async function apiPostForm(path, formData) {
   });
 }
 
-/** GET */
-export async function apiGet(path) {
-  return apiFetch(path, { cache: "no-store" });
+export async function apiGet(path, options = {}) {
+  return apiFetch(path, { ...options, method: "GET", cache: "no-store" });
 }
 
-/** DELETE */
 export async function apiDelete(path) {
   return apiFetch(path, { method: "DELETE" });
 }
 
-// ── Auth helpers ──────────────────────────────────────────────────────────────
-
-/** Returns the stored user object or null */
 export function getUser() {
   try {
     return JSON.parse(localStorage.getItem("user"));
@@ -74,16 +86,13 @@ export function getUser() {
   }
 }
 
-/** Returns true if a token exists in localStorage */
 export function isLoggedIn() {
-  return !!localStorage.getItem("token");
+  return Boolean(localStorage.getItem("token"));
 }
 
-/** Clears auth state and redirects to login */
 export function logout() {
   localStorage.removeItem("token");
   localStorage.removeItem("user");
-  localStorage.removeItem("adminVerified");
   window.dispatchEvent(new Event("authChange"));
-  window.location.href = "/login";
+  window.location.assign("/login");
 }

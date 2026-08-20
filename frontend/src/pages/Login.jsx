@@ -33,7 +33,6 @@ const Login = () => {
       if (response.ok) {
         localStorage.setItem("token", data.token);
         localStorage.setItem("user", JSON.stringify(data.user));
-        localStorage.removeItem("adminVerified");
         // Notify Navbar in the same tab
         window.dispatchEvent(new Event("authChange"));
         navigate("/dashboard");

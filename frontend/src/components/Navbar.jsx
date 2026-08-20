@@ -6,9 +6,13 @@ import styles from "./Navbar.module.css";
 const Navbar = () => {
   const [menuOpen,  setMenuOpen]  = useState(false);
   const [isLoggedIn, setIsLoggedIn] = useState(!!localStorage.getItem("token"));
-  const [isAdminVerified, setIsAdminVerified] = useState(
-    localStorage.getItem("adminVerified") === "true"
-  );
+  const [isAdmin, setIsAdmin] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem("user"))?.role === "admin";
+    } catch {
+      return false;
+    }
+  });
   const [scrolled,  setScrolled]  = useState(false);
   const [glitching, setGlitching] = useState(false);
   const glitchTimer = useRef(null);
@@ -19,7 +23,11 @@ const Navbar = () => {
   useEffect(() => {
     const checkAuth = () => {
       setIsLoggedIn(!!localStorage.getItem("token"));
-      setIsAdminVerified(localStorage.getItem("adminVerified") === "true");
+      try {
+        setIsAdmin(JSON.parse(localStorage.getItem("user"))?.role === "admin");
+      } catch {
+        setIsAdmin(false);
+      }
     };
     checkAuth();
     window.addEventListener("storage", checkAuth);
@@ -65,10 +73,9 @@ const Navbar = () => {
   const handleLogout = () => {
     localStorage.removeItem("token");
     localStorage.removeItem("user");
-    localStorage.removeItem("adminVerified");
     window.dispatchEvent(new Event("authChange"));
     setIsLoggedIn(false);
-    setIsAdminVerified(false);
+    setIsAdmin(false);
     closeMenu();
     navigate("/login");
   };
@@ -115,10 +122,13 @@ const Navbar = () => {
           </>
         ) : (
           <>
-            <NavLink to="/dashboard"       onClick={closeMenu} index={0}>Dashboard</NavLink>
-            <NavLink to="/monitor-contest" onClick={closeMenu} index={1}>Monitor Contest</NavLink>
-            {isAdminVerified && (
-              <NavLink to="/host-contest" onClick={closeMenu} index={2}>Host Contest</NavLink>
+            <NavLink to="/dashboard"  onClick={closeMenu} index={0}>Dashboard</NavLink>
+            <NavLink to="/violations" onClick={closeMenu} index={1}>Violations</NavLink>
+            {isAdmin && (
+              <>
+                <NavLink to="/monitor-contest" onClick={closeMenu} index={2}>Monitor Contest</NavLink>
+                <NavLink to="/host-contest" onClick={closeMenu} index={3}>Host Contest</NavLink>
+              </>
             )}
           </>
         )}

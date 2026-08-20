@@ -9,7 +9,9 @@ const TYPED_TEXT = "// ai detection in competitive programming";
 const Home = () => {
   const navigate = useNavigate();
   const [typed, setTyped] = useState("");
+  const [copied, setCopied] = useState(false);
   const isAdmin = getUser()?.role === "admin";
+  const currentPortal = typeof window === "undefined" ? "" : window.location.origin;
 
   useEffect(() => {
     let i = 0;
@@ -24,6 +26,16 @@ const Home = () => {
   const handleProtectedNavigation = (path) => {
     const token = localStorage.getItem("token");
     navigate(token ? path : "/login");
+  };
+
+  const copyPortalAddress = async () => {
+    try {
+      await navigator.clipboard.writeText(currentPortal);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1800);
+    } catch {
+      setCopied(false);
+    }
   };
 
   return (
@@ -43,6 +55,17 @@ const Home = () => {
           Monitor nodes, analyze traffic, and manage deployments in real-time.
         </p>
 
+        <div className={styles.networkPanel}>
+          <div>
+            <span className={styles.networkLabel}>AUTHORIZED LAN PORTAL</span>
+            <p>Share the contest host&apos;s LAN URL with participants on the same Wi-Fi. The host must keep this service running, and the router must allow peer-to-peer access.</p>
+            <code>{currentPortal}</code>
+          </div>
+          <button type="button" className={styles.copyBtn} onClick={copyPortalAddress}>
+            {copied ? "Copied" : "Copy URL"}
+          </button>
+        </div>
+
         <div className={styles.features}>
           <div className={styles.featureItem}>
             <FaShieldAlt className={styles.fIcon} />
@@ -57,6 +80,8 @@ const Home = () => {
             <span>Encrypted</span>
           </div>
         </div>
+
+        <p className={styles.disclaimer}>Detection uses consent-based DNS and TLS host metadata only. It does not decrypt traffic, capture packet payloads, or establish conclusive proof of AI use.</p>
 
         <div className={styles.buttonGroup}>
           <button

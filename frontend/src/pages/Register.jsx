@@ -34,8 +34,11 @@ const Register = () => {
     if (formData.password !== formData.confirmPassword) {
       return setError("Passwords do not match");
     }
-    if (formData.password.length < 6) {
-      return setError("Password must be at least 6 characters");
+    if (formData.password.length < 10) {
+      return setError("Password must be at least 10 characters");
+    }
+    if (formData.password.length > 200) {
+      return setError("Password must be at most 200 characters");
     }
 
     try {
@@ -113,8 +116,10 @@ const Register = () => {
             className={styles.input}
             type="password"
             placeholder="••••••••••••"
-            required
-            value={formData.password}
+              required
+              minLength={10}
+              maxLength={200}
+              value={formData.password}
             onChange={(e) => setFormData({ ...formData, password: e.target.value })}
           />
         </div>
@@ -126,8 +131,10 @@ const Register = () => {
             className={styles.input}
             type="password"
             placeholder="••••••••••••"
-            required
-            value={formData.confirmPassword}
+              required
+              minLength={10}
+              maxLength={200}
+              value={formData.confirmPassword}
             onChange={(e) => setFormData({ ...formData, confirmPassword: e.target.value })}
           />
         </div>

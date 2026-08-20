@@ -2,17 +2,22 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/csv"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/mail"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	firebase "firebase.google.com/go/v4"
 	"firebase.google.com/go/v4/db"
@@ -35,11 +40,31 @@ var bst = func() *time.Location {
 	return loc
 }()
 
-// nowBST returns the current time in BST.
-func nowBST() time.Time { return time.Now().In(bst) }
-
 // fmtBST formats a time as HH:MM:SS in BST.
 func fmtBST(t time.Time) string { return t.In(bst).Format("15:04:05") }
+
+// ── Timeouts ──────────────────────────────────────────────────────────────────
+// dbOpTimeout bounds every Firebase RTDB call. Without this, a blocked or
+// throttled network (captive portals, restrictive wifi, DNS failures on the
+// path to Google's servers) makes requests hang indefinitely with no
+// feedback to the client. With it, requests fail fast with a clear error.
+const dbOpTimeout = 8 * time.Second
+
+// withDBTimeout returns a context bounded by dbOpTimeout, rooted in the
+// application's background context. Callers must defer the returned cancel.
+func withDBTimeout() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), dbOpTimeout)
+}
+
+// isDBUnreachable is a small helper so handlers can respond with a
+// consistent, honest status code (503, not 500) when the problem is
+// connectivity to Firebase rather than a bug in the request itself.
+func dbUnreachableJSON(c *gin.Context, action string, err error) {
+	log.Printf("[DB] %s error: %v", action, err)
+	c.JSON(http.StatusServiceUnavailable, gin.H{
+		"error": "cannot reach database — check the server's internet connection",
+	})
+}
 
 // ── Models ────────────────────────────────────────────────────────────────────
 type User struct {
@@ -47,7 +72,7 @@ type User struct {
 	Name     string `json:"name"`
 	Email    string `json:"email"`
 	Password string `json:"password,omitempty"`
-	Role string `json:"role"`
+	Role     string `json:"role"`
 }
 
 // sanitizedForClient returns a copy of the user with the password hash removed.
@@ -57,10 +82,11 @@ func (u User) sanitizedForClient() User {
 }
 
 type Contest struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	StartTime time.Time `json:"start_time"`
-	EndTime   time.Time `json:"end_time"`
+	ID               string    `json:"id"`
+	Name             string    `json:"name"`
+	StartTime        time.Time `json:"start_time"`
+	EndTime          time.Time `json:"end_time"`
+	CaptureConsented bool      `json:"capture_consented"`
 }
 
 // Participant lives at contests/{contestID}/participants/{sanitizedIP}
@@ -118,13 +144,56 @@ var (
 	rtdb      *db.Client
 	jwtSecret []byte
 	aiDomains = []string{
-		"chatgpt", "openai", "gemini", "grok", "claude", "anthropic",
-		"perplexity", "deepseek", "manus", "stackoverflow", "geeksforgeeks",
+		"chatgpt.com", "openai.com", "gemini.google.com", "grok.com", "claude.ai",
+		"anthropic.com", "perplexity.ai", "deepseek.com", "copilot.microsoft.com",
+		"poe.com", "phind.com", "blackbox.ai", "you.com", "aistudio.google.com",
 	}
 
 	snifferCancels   = make(map[string]context.CancelFunc)
 	snifferCancelsMu sync.Mutex
+	hitQueue         chan hitEvent
+	recentHits       = make(map[string]time.Time)
+	recentHitsMu     sync.Mutex
+	registrationMu   sync.Mutex
+	publicLimiter    = newRateLimiter()
 )
+
+type hitEvent struct {
+	contest Contest
+	srcIP   string
+	domain  string
+}
+
+type rateEntry struct {
+	count int
+	reset time.Time
+}
+
+type rateLimiter struct {
+	mu      sync.Mutex
+	entries map[string]rateEntry
+}
+
+func newRateLimiter() *rateLimiter {
+	return &rateLimiter{entries: make(map[string]rateEntry)}
+}
+
+func (l *rateLimiter) allow(key string, limit int, window time.Duration) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	entry := l.entries[key]
+	if entry.reset.IsZero() || now.After(entry.reset) {
+		entry = rateEntry{reset: now.Add(window)}
+	}
+	if entry.count >= limit {
+		l.entries[key] = entry
+		return false
+	}
+	entry.count++
+	l.entries[key] = entry
+	return true
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -149,10 +218,15 @@ func normalizeIP(addr string) string {
 }
 
 func containsAIDomain(s string) string {
-	lower := strings.ToLower(s)
-	for _, d := range aiDomains {
-		if strings.Contains(lower, d) {
-			return d
+	candidates := strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+		return unicode.IsSpace(r) || strings.ContainsRune(":/='\";,()[]", r)
+	})
+	for _, candidate := range candidates {
+		candidate = strings.Trim(candidate, ".")
+		for _, domain := range aiDomains {
+			if candidate == domain || strings.HasSuffix(candidate, "."+domain) {
+				return domain
+			}
 		}
 	}
 	return ""
@@ -171,7 +245,7 @@ func splitMembers(raw string) []string {
 }
 
 // sanitizeKey makes a string safe to use as a Firebase Realtime Database key.
-// RTDB forbids '.', '#', '$', '[', ']', '/' in keys — this is used for both
+// RTDB forbids '.', '#', '$', '[', ']', '/' in keys.
 var keyReplacer = strings.NewReplacer(
 	".", "_",
 	"#", "_",
@@ -227,8 +301,8 @@ func firebaseCredentialOption() (option.ClientOption, error) {
 
 func initJWTSecret() {
 	secret := os.Getenv("JWT_SECRET")
-	if secret == "" {
-		log.Fatal("[JWT] JWT_SECRET is required — set it in .env")
+	if len(secret) < 32 {
+		log.Fatal("[JWT] JWT_SECRET must be at least 32 characters")
 	}
 	jwtSecret = []byte(secret)
 }
@@ -236,17 +310,15 @@ func initJWTSecret() {
 // ── JWT Middleware ────────────────────────────────────────────────────────────
 
 func authMiddleware() gin.HandlerFunc {
+	parser := jwt.NewParser(jwt.WithValidMethods([]string{"HS256"}))
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if !strings.HasPrefix(authHeader, "Bearer ") {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "authorization header required"})
 			return
 		}
-		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-		token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-			}
+		tokenStr := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+		token, err := parser.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
 			return jwtSecret, nil
 		})
 		if err != nil || !token.Valid {
@@ -258,8 +330,14 @@ func authMiddleware() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token claims"})
 			return
 		}
-		c.Set("user_id", claims["user_id"])
-		c.Set("role", claims["role"])
+		userID, userOK := claims["user_id"].(string)
+		role, roleOK := claims["role"].(string)
+		if !userOK || userID == "" || !roleOK || role == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token claims"})
+			return
+		}
+		c.Set("user_id", userID)
+		c.Set("role", role)
 		c.Next()
 	}
 }
@@ -275,73 +353,157 @@ func requireAdmin() gin.HandlerFunc {
 	}
 }
 
+func corsMiddleware() gin.HandlerFunc {
+	allowed := make(map[string]struct{})
+	for _, origin := range strings.Split(getEnv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"), ",") {
+		if origin = strings.TrimSpace(origin); origin != "" {
+			allowed[origin] = struct{}{}
+		}
+	}
+	return func(c *gin.Context) {
+		origin := c.GetHeader("Origin")
+		if origin != "" {
+			if _, ok := allowed[origin]; ok {
+				c.Header("Access-Control-Allow-Origin", origin)
+				c.Header("Vary", "Origin")
+			}
+		}
+		if c.Request.Method == http.MethodOptions {
+			if origin == "" {
+				c.AbortWithStatus(http.StatusNoContent)
+				return
+			}
+			if _, ok := allowed[origin]; !ok {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "origin not allowed; configure this LAN origin or use the frontend proxy"})
+				return
+			}
+			c.Header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+			c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
+	}
+}
+
+func requestBodyLimit(maxBytes int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+		c.Next()
+	}
+}
+
+func publicRateLimit() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Method == http.MethodPost && (c.Request.URL.Path == "/login" || c.Request.URL.Path == "/register") {
+			ip := normalizeIP(c.Request.RemoteAddr)
+			if !publicLimiter.allow(ip+":"+c.Request.URL.Path, 10, time.Minute) {
+				c.Header("Retry-After", "60")
+				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "too many attempts; try again later"})
+				return
+			}
+		}
+		c.Next()
+	}
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 func main() {
-	probeInterfaces()
 	initFirebase()
 	initJWTSecret()
-
+	startHitRecorder()
+	if captureEnabled() {
+		probeInterfaces()
+	}
 	resumeActiveSniffers()
 
 	gin.SetMode(getEnv("GIN_MODE", "release"))
 	r := gin.New()
-	r.Use(gin.Logger(), gin.Recovery())
-
-	// CORS
-	r.Use(func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(204)
-			return
-		}
-		c.Next()
-	})
+	r.Use(gin.Logger(), gin.Recovery(), corsMiddleware(), requestBodyLimit(10<<20), publicRateLimit())
 
 	r.POST("/login", login)
 	r.POST("/register", register)
 
-	auth := r.Group("/", authMiddleware())
-	{
-		auth.GET("/contests", getContests)
-		auth.GET("/contests/:id/monitor", monitorTelemetry)
-		auth.GET("/contests/:id/violations", getViolations)
-		auth.GET("/contests/:id/ai-hits", getAIHits)
-	}
+	// Health is intentionally unauthenticated and contains no user or contest data.
+	r.GET("/health", healthCheck)
 
+	auth := r.Group("/", authMiddleware())
+	auth.GET("/contests", getContests)
+	auth.GET("/contests/:id/public-violations", getPublicViolations)
+
+	// Detailed telemetry and roster data are administrator-only because they
+	// contain participant identifiers and network-derived signals.
 	admin := r.Group("/", authMiddleware(), requireAdmin())
 	{
 		admin.POST("/host-contest", hostContest)
 		admin.DELETE("/contests/:id", deleteContest)
+		admin.GET("/contests/:id/monitor", monitorTelemetry)
+		admin.GET("/contests/:id/violations", getViolations)
+		admin.GET("/contests/:id/ai-hits", getAIHits)
 	}
 
 	port := getEnv("PORT", "8081")
-	log.Printf("[GIN] listening on :%s", port)
-	if err := r.Run(":" + port); err != nil {
-		log.Fatalf("[GIN] server error: %v", err)
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
+	log.Printf("[HTTP] listening on %s (LAN access is available through the host address)", server.Addr)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("[HTTP] server error: %v", err)
+	}
+}
+
+func healthCheck(c *gin.Context) {
+	dbCtx, cancel := withDBTimeout()
+	defer cancel()
+
+	var probe string
+	if err := rtdb.NewRef("__health").Get(dbCtx, &probe); err != nil {
+		log.Printf("[HEALTH] db unreachable: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status": "db_unreachable",
+			"error":  err.Error(),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "capture_enabled": captureEnabled()})
 }
 
 // resumeActiveSniffers restarts packet capture for contests still active after restart.
 func resumeActiveSniffers() {
+	if !captureEnabled() {
+		log.Println("[RESUME] packet capture disabled; no sniffers started")
+		return
+	}
+	dbCtx, cancel := withDBTimeout()
+	defer cancel()
+
 	var contests map[string]Contest
-	if err := rtdb.NewRef("contests").Get(ctx, &contests); err != nil {
-		log.Printf("[RESUME] could not load contests: %v", err)
+	if err := rtdb.NewRef("contests").Get(dbCtx, &contests); err != nil {
+		log.Printf("[RESUME] could not load contests (db unreachable?): %v", err)
 		return
 	}
 	now := time.Now().UTC()
 	for id, c := range contests {
 		c.ID = id
-		if now.Before(c.EndTime) {
-			log.Printf("[RESUME] restarting sniffer for contest %s (%s)", c.ID, c.Name)
+		if c.CaptureConsented && now.Before(c.EndTime) {
+			log.Printf("[RESUME] restarting consented sniffer for contest %s (%s)", c.ID, c.Name)
 			startSniffer(c)
 		}
 	}
 }
 
 // ── Interface probing ─────────────────────────────────────────────────────────
+
+func captureEnabled() bool {
+	return strings.EqualFold(strings.TrimSpace(getEnv("CAPTURE_ENABLED", "false")), "true")
+}
 
 func probeInterfaces() {
 	log.Println("[IFACE] ── Probing network interfaces ──────────────────────")
@@ -508,6 +670,10 @@ func extractDNSHostnames(payload []byte) []string {
 // ── Sniffer ───────────────────────────────────────────────────────────────────
 
 func startSniffer(contest Contest) {
+	if !captureEnabled() || !contest.CaptureConsented {
+		log.Printf("[SNIFFER] contest %s: capture disabled or consent not recorded", contest.ID)
+		return
+	}
 	ifaces := getSniffInterfaces()
 	if len(ifaces) == 0 {
 		log.Printf("[SNIFFER] contest %s: no usable interfaces — sniffing disabled", contest.ID)
@@ -628,42 +794,73 @@ func sniffInterface(sctx context.Context, iface string, contest Contest) {
 }
 
 // ── Hit recording ─────────────────────────────────────────────────────────────
+
+func startHitRecorder() {
+	if hitQueue != nil {
+		return
+	}
+	hitQueue = make(chan hitEvent, 1024)
+	for worker := 0; worker < 2; worker++ {
+		go func() {
+			for event := range hitQueue {
+				recordHitSync(event.contest, event.srcIP, event.domain)
+			}
+		}()
+	}
+}
+
+// recordHit is intentionally non-blocking so a Firebase outage cannot stop
+// packet capture. It records only a domain/IP signal, never packet payloads.
 func recordHit(contest Contest, srcIP, domain string) {
+	if !captureEnabled() || !contest.CaptureConsented || hitQueue == nil {
+		return
+	}
+	key := contest.ID + "|" + srcIP + "|" + domain
+	now := time.Now().UTC()
+	recentHitsMu.Lock()
+	if previous, ok := recentHits[key]; ok && now.Sub(previous) < 10*time.Minute {
+		recentHitsMu.Unlock()
+		return
+	}
+	recentHits[key] = now
+	if len(recentHits) > 10000 {
+		for k, t := range recentHits {
+			if now.Sub(t) > 10*time.Minute {
+				delete(recentHits, k)
+			}
+		}
+	}
+	recentHitsMu.Unlock()
+
+	select {
+	case hitQueue <- hitEvent{contest: contest, srcIP: srcIP, domain: domain}:
+	default:
+		log.Printf("[SNIFFER] recorder queue full; dropping metadata signal for %s", srcIP)
+	}
+}
+
+func recordHitSync(contest Contest, srcIP, domain string) {
+	dbCtx, cancel := withDBTimeout()
+	defer cancel()
+
 	now := time.Now().UTC()
 	contestRef := rtdb.NewRef("contests/" + contest.ID)
-
-	// Traffic log — append-only history of every AI-domain packet seen.
-	if _, err := contestRef.Child("traffic_logs").Push(ctx, TrafficLog{
+	if _, err := contestRef.Child("traffic_logs").Push(dbCtx, TrafficLog{
 		IP:        srcIP,
 		AIService: domain,
 		Timestamp: now,
 	}); err != nil {
 		log.Printf("[SNIFFER] traffic_logs insert error: %v", err)
 	}
-
-	// Deduped ai_hits — skip if the same IP+domain hit within the last 10 minutes.
-	ahRef := contestRef.Child("ai_hits")
-	var recent map[string]AIHit
-	if err := ahRef.OrderByChild("ip").EqualTo(srcIP).Get(ctx, &recent); err != nil {
-		log.Printf("[SNIFFER] ai_hits query error: %v", err)
-	}
-	dup := false
-	for _, h := range recent {
-		if h.Domain == domain && now.Sub(h.CreatedAt) < 10*time.Minute {
-			dup = true
-			break
-		}
-	}
-	if !dup {
-		if _, err := ahRef.Push(ctx, AIHit{IP: srcIP, Domain: domain, CreatedAt: now}); err != nil {
-			log.Printf("[SNIFFER] ai_hits insert error: %v", err)
-		}
+	if _, err := contestRef.Child("ai_hits").Push(dbCtx, AIHit{
+		IP: srcIP, Domain: domain, CreatedAt: now,
+	}); err != nil {
+		log.Printf("[SNIFFER] ai_hits insert error: %v", err)
 	}
 
-	// Flag the participant (only if they exist in the roster for this contest).
 	pRef := contestRef.Child("participants").Child(sanitizeKey(srcIP))
 	var existing Participant
-	if err := pRef.Get(ctx, &existing); err != nil {
+	if err := pRef.Get(dbCtx, &existing); err != nil {
 		log.Printf("[SNIFFER] participant lookup error: %v", err)
 		return
 	}
@@ -671,7 +868,7 @@ func recordHit(contest Contest, srcIP, domain string) {
 		log.Printf("[SNIFFER] domain=%-20s  src=%-18s  contest=%s  rows_updated=0 (unknown participant)", domain, srcIP, contest.ID)
 		return
 	}
-	if err := pRef.Update(ctx, map[string]interface{}{
+	if err := pRef.Update(dbCtx, map[string]interface{}{
 		"ai_violation": true,
 		"last_seen":    now,
 	}); err != nil {
@@ -685,8 +882,16 @@ func recordHit(contest Contest, srcIP, domain string) {
 
 func hostContest(c *gin.Context) {
 	name := strings.TrimSpace(c.PostForm("contestName"))
-	if name == "" {
-		c.JSON(400, gin.H{"error": "contestName is required"})
+	if name == "" || len([]rune(name)) > 120 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "contestName is required and must be at most 120 characters"})
+		return
+	}
+	if strings.ToLower(strings.TrimSpace(c.PostForm("captureConsent"))) != "true" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "explicit participant-consent acknowledgement is required before capture can start"})
+		return
+	}
+	if !captureEnabled() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "packet capture is disabled; set CAPTURE_ENABLED=true only on the authorized contest host"})
 		return
 	}
 
@@ -715,95 +920,141 @@ func hostContest(c *gin.Context) {
 		}
 	}
 
-	durationStr := c.PostForm("duration")
-	durationMin, err := time.ParseDuration(durationStr + "m")
-	if err != nil || durationMin <= 0 || durationMin > 24*time.Hour {
-		c.JSON(400, gin.H{"error": "invalid duration (1–1440 minutes expected)"})
+	durationMinutes, err := strconv.Atoi(strings.TrimSpace(c.PostForm("duration")))
+	if err != nil || durationMinutes < 1 || durationMinutes > 24*60 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid duration (1–1440 whole minutes expected)"})
 		return
 	}
+	durationMin := time.Duration(durationMinutes) * time.Minute
 
 	file, err := c.FormFile("file")
 	if err != nil {
-		c.JSON(400, gin.H{"error": "csv file required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "csv file required"})
 		return
 	}
-	if !strings.HasSuffix(strings.ToLower(file.Filename), ".csv") {
-		c.JSON(400, gin.H{"error": "uploaded file must be a .csv"})
+	if file.Size <= 0 || file.Size > 5<<20 || !strings.HasSuffix(strings.ToLower(file.Filename), ".csv") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "uploaded CSV must be non-empty, have a .csv extension, and be at most 5 MiB"})
 		return
 	}
 
 	f, err := file.Open()
 	if err != nil {
-		c.JSON(400, gin.H{"error": "failed to open uploaded file"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to open uploaded file"})
 		return
 	}
 	defer f.Close()
 
-	records, err := csv.NewReader(f).ReadAll()
-	if err != nil {
-		c.JSON(400, gin.H{"error": "failed to parse CSV"})
+	reader := csv.NewReader(io.LimitReader(f, 5<<20))
+	reader.FieldsPerRecord = -1
+	records, err := reader.ReadAll()
+	if err != nil || len(records) < 2 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "CSV must contain a header and at least one participant row"})
+		return
+	}
+	if len(records[0]) < 2 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "CSV header must contain team_name and ip"})
+		return
+	}
+	headerTeam := strings.TrimPrefix(strings.TrimSpace(records[0][0]), "\ufeff")
+	if !strings.EqualFold(headerTeam, "team_name") || !strings.EqualFold(strings.TrimSpace(records[0][1]), "ip") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "CSV header must begin with team_name, ip"})
 		return
 	}
 
-	participants := make(map[string]Participant)
-	for i := 1; i < len(records); i++ {
-		row := records[i]
+	participants := make(map[string]Participant, len(records)-1)
+	for rowNumber := 1; rowNumber < len(records); rowNumber++ {
+		row := records[rowNumber]
 		if len(row) < 2 {
-			continue
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("CSV row %d must contain team_name and ip", rowNumber+1)})
+			return
 		}
 		teamName := strings.TrimSpace(row[0])
-		ip := normalizeIP(strings.TrimSpace(row[1]))
-		members := ""
-		if len(row) > 2 {
-			members = strings.Join(row[2:], ", ")
+		if teamName == "" || len([]rune(teamName)) > 120 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("CSV row %d has an invalid team name", rowNumber+1)})
+			return
 		}
-		participants[sanitizeKey(ip)] = Participant{
-			TeamName:    teamName,
-			IP:          ip,
-			Members:     members,
-			AIViolation: false,
+		ipValue := strings.TrimSpace(row[1])
+		parsedIP := net.ParseIP(ipValue)
+		if parsedIP == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("CSV row %d has an invalid IP address", rowNumber+1)})
+			return
+		}
+		ip := normalizeIP(parsedIP.String())
+		key := sanitizeKey(ip)
+		if _, exists := participants[key]; exists {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("CSV contains duplicate IP address %s", ip)})
+			return
+		}
+		memberValues := make([]string, 0, len(row)-2)
+		for _, member := range row[2:] {
+			member = strings.TrimSpace(member)
+			if member != "" {
+				memberValues = append(memberValues, member)
+			}
+		}
+		members := strings.Join(memberValues, ", ")
+		if len([]rune(members)) > 1000 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("CSV row %d has too much member data", rowNumber+1)})
+			return
+		}
+		participants[key] = Participant{
+			TeamName: teamName,
+			IP:       ip,
+			Members:  members,
 		}
 	}
 
+	dbCtx, cancel := withDBTimeout()
+	defer cancel()
+
 	// Reserve a new contest ID (Firebase push key — chronologically sortable).
-	newRef, err := rtdb.NewRef("contests").Push(ctx, nil)
+	newRef, err := rtdb.NewRef("contests").Push(dbCtx, nil)
 	if err != nil {
-		log.Printf("[HOST] create contest key error: %v", err)
-		c.JSON(500, gin.H{"error": "failed to create contest"})
+		dbUnreachableJSON(c, "create contest key", err)
 		return
 	}
 	contestID := newRef.Key
 
 	endTime := startTime.Add(durationMin)
 	contest := Contest{
-		ID:        contestID,
-		Name:      name,
-		StartTime: startTime,
-		EndTime:   endTime,
+		ID:               contestID,
+		Name:             name,
+		StartTime:        startTime,
+		EndTime:          endTime,
+		CaptureConsented: true,
 	}
 
-	if err := newRef.Set(ctx, contest); err != nil {
-		log.Printf("[HOST] write contest error: %v", err)
-		c.JSON(500, gin.H{"error": "failed to create contest"})
+	if err := newRef.Set(dbCtx, contest); err != nil {
+		dbUnreachableJSON(c, "write contest", err)
 		return
 	}
 	if len(participants) > 0 {
-		if err := newRef.Child("participants").Set(ctx, participants); err != nil {
-			log.Printf("[HOST] write participants error: %v", err)
-			c.JSON(500, gin.H{"error": "failed to store participants"})
+		if err := newRef.Child("participants").Set(dbCtx, participants); err != nil {
+			_ = newRef.Delete(dbCtx)
+			dbUnreachableJSON(c, "write participants", err)
 			return
 		}
 	}
 
-	go startSniffer(contest)
-	c.JSON(200, contest)
+	if captureEnabled() {
+		go startSniffer(contest)
+	}
+	c.JSON(http.StatusCreated, gin.H{
+		"contest":         contest,
+		"capture_enabled": captureEnabled(),
+		"message":         "contest created; packet metadata capture is active only when CAPTURE_ENABLED=true and this consent acknowledgement is recorded",
+	})
 }
 
 func deleteContest(c *gin.Context) {
 	id := c.Param("id")
+
+	dbCtx, cancel := withDBTimeout()
+	defer cancel()
+
 	var contest Contest
-	if err := rtdb.NewRef("contests/"+id).Get(ctx, &contest); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+	if err := rtdb.NewRef("contests/"+id).Get(dbCtx, &contest); err != nil {
+		dbUnreachableJSON(c, "fetch contest", err)
 		return
 	}
 	if contest.Name == "" {
@@ -811,9 +1062,8 @@ func deleteContest(c *gin.Context) {
 		return
 	}
 	stopSniffer(id)
-	if err := rtdb.NewRef("contests/" + id).Delete(ctx); err != nil {
-		log.Printf("[DELETE] contest %s error: %v", id, err)
-		c.JSON(500, gin.H{"error": "failed to delete contest"})
+	if err := rtdb.NewRef("contests/" + id).Delete(dbCtx); err != nil {
+		dbUnreachableJSON(c, "delete contest", err)
 		return
 	}
 	c.JSON(200, gin.H{"status": "deleted"})
@@ -822,15 +1072,22 @@ func deleteContest(c *gin.Context) {
 func monitorTelemetry(c *gin.Context) {
 	id := c.Param("id")
 
+	dbCtx, cancel := withDBTimeout()
+	defer cancel()
+
 	var contest Contest
-	if err := rtdb.NewRef("contests/"+id).Get(ctx, &contest); err != nil || contest.Name == "" {
+	if err := rtdb.NewRef("contests/"+id).Get(dbCtx, &contest); err != nil {
+		dbUnreachableJSON(c, "fetch contest", err)
+		return
+	}
+	if contest.Name == "" {
 		c.JSON(404, gin.H{"error": "contest not found"})
 		return
 	}
 
 	var participants map[string]Participant
-	if err := rtdb.NewRef("contests/"+id+"/participants").Get(ctx, &participants); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+	if err := rtdb.NewRef("contests/"+id+"/participants").Get(dbCtx, &participants); err != nil {
+		dbUnreachableJSON(c, "fetch participants", err)
 		return
 	}
 
@@ -858,15 +1115,22 @@ func monitorTelemetry(c *gin.Context) {
 func getViolations(c *gin.Context) {
 	id := c.Param("id")
 
+	dbCtx, cancel := withDBTimeout()
+	defer cancel()
+
 	var contest Contest
-	if err := rtdb.NewRef("contests/"+id).Get(ctx, &contest); err != nil || contest.Name == "" {
+	if err := rtdb.NewRef("contests/"+id).Get(dbCtx, &contest); err != nil {
+		dbUnreachableJSON(c, "fetch contest", err)
+		return
+	}
+	if contest.Name == "" {
 		c.JSON(404, gin.H{"error": "contest not found"})
 		return
 	}
 
 	var participants map[string]Participant
-	if err := rtdb.NewRef("contests/"+id+"/participants").Get(ctx, &participants); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+	if err := rtdb.NewRef("contests/"+id+"/participants").Get(dbCtx, &participants); err != nil {
+		dbUnreachableJSON(c, "fetch participants", err)
 		return
 	}
 
@@ -884,15 +1148,63 @@ func getViolations(c *gin.Context) {
 			Members:    splitMembers(p.Members),
 			IP:         p.IP,
 			DetectedAt: detectedAt,
-			Domain:     latestDomainForIP(id, p.IP),
+			Domain:     latestDomainForIP(dbCtx, id, p.IP),
 		})
 	}
 	c.JSON(200, violations)
 }
 
-func latestDomainForIP(contestID, ip string) string {
+type PublicViolation struct {
+	TeamName   string `json:"team_name"`
+	DetectedAt string `json:"detected_at"`
+	Domain     string `json:"domain"`
+}
+
+func getPublicViolations(c *gin.Context) {
+	id := c.Param("id")
+	dbCtx, cancel := withDBTimeout()
+	defer cancel()
+
+	var contest Contest
+	if err := rtdb.NewRef("contests/"+id).Get(dbCtx, &contest); err != nil {
+		dbUnreachableJSON(c, "fetch contest", err)
+		return
+	}
+	if contest.Name == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "contest not found"})
+		return
+	}
+
+	var participants map[string]Participant
+	if err := rtdb.NewRef("contests/"+id+"/participants").Get(dbCtx, &participants); err != nil {
+		dbUnreachableJSON(c, "fetch participants", err)
+		return
+	}
+
+	violations := make([]PublicViolation, 0)
+	for _, participant := range participants {
+		if !participant.AIViolation {
+			continue
+		}
+		detectedAt := "Unknown"
+		if !participant.LastSeen.IsZero() {
+			detectedAt = fmtBST(participant.LastSeen)
+		}
+		violations = append(violations, PublicViolation{
+			TeamName:   participant.TeamName,
+			DetectedAt: detectedAt,
+			Domain:     latestDomainForIP(dbCtx, id, participant.IP),
+		})
+	}
+	sort.Slice(violations, func(i, j int) bool {
+		return violations[i].TeamName < violations[j].TeamName
+	})
+	c.JSON(http.StatusOK, violations)
+}
+
+func latestDomainForIP(dbCtx context.Context, contestID, ip string) string {
 	var hits map[string]AIHit
-	if err := rtdb.NewRef("contests/"+contestID+"/ai_hits").OrderByChild("ip").EqualTo(ip).Get(ctx, &hits); err != nil {
+	if err := rtdb.NewRef("contests/"+contestID+"/ai_hits").OrderByChild("ip").EqualTo(ip).Get(dbCtx, &hits); err != nil {
 		log.Printf("[VIOLATIONS] ai_hits query error: %v", err)
 		return ""
 	}
@@ -908,19 +1220,29 @@ func latestDomainForIP(contestID, ip string) string {
 func getAIHits(c *gin.Context) {
 	id := c.Param("id")
 
+	dbCtx, cancel := withDBTimeout()
+	defer cancel()
+
 	var contest Contest
-	if err := rtdb.NewRef("contests/"+id).Get(ctx, &contest); err != nil || contest.Name == "" {
+	if err := rtdb.NewRef("contests/"+id).Get(dbCtx, &contest); err != nil {
+		dbUnreachableJSON(c, "fetch contest", err)
+		return
+	}
+	if contest.Name == "" {
 		c.JSON(404, gin.H{"error": "contest not found"})
 		return
 	}
 
 	var hitsMap map[string]AIHit
-	if err := rtdb.NewRef("contests/"+id+"/ai_hits").Get(ctx, &hitsMap); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+	if err := rtdb.NewRef("contests/"+id+"/ai_hits").Get(dbCtx, &hitsMap); err != nil {
+		dbUnreachableJSON(c, "fetch ai_hits", err)
 		return
 	}
 	var participants map[string]Participant
-	rtdb.NewRef("contests/" + id + "/participants").Get(ctx, &participants) // best-effort join
+	if err := rtdb.NewRef("contests/"+id+"/participants").Get(dbCtx, &participants); err != nil {
+		// best-effort join — log but don't fail the whole request over it
+		log.Printf("[AI-HITS] participants fetch error: %v", err)
+	}
 
 	byIP := make(map[string]Participant, len(participants))
 	for _, p := range participants {
@@ -957,9 +1279,12 @@ func getAIHits(c *gin.Context) {
 }
 
 func getContests(c *gin.Context) {
+	dbCtx, cancel := withDBTimeout()
+	defer cancel()
+
 	var contestsMap map[string]Contest
-	if err := rtdb.NewRef("contests").Get(ctx, &contestsMap); err != nil {
-		c.JSON(500, gin.H{"error": "failed to fetch contests"})
+	if err := rtdb.NewRef("contests").Get(dbCtx, &contestsMap); err != nil {
+		dbUnreachableJSON(c, "fetch contests", err)
 		return
 	}
 	list := make([]Contest, 0, len(contestsMap))
@@ -971,6 +1296,15 @@ func getContests(c *gin.Context) {
 	c.JSON(200, list)
 }
 
+func emailIndexKey(email string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(email))
+}
+
+func validateEmail(email string) bool {
+	parsed, err := mail.ParseAddress(email)
+	return err == nil && parsed.Address == email && len(email) <= 254
+}
+
 func register(c *gin.Context) {
 	var in struct {
 		FirstName string `json:"firstName"`
@@ -979,64 +1313,59 @@ func register(c *gin.Context) {
 		Password  string `json:"password"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
-		c.JSON(400, gin.H{"error": "invalid request body"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
 	in.FirstName = strings.TrimSpace(in.FirstName)
 	in.LastName = strings.TrimSpace(in.LastName)
 	in.Email = strings.TrimSpace(strings.ToLower(in.Email))
 
-	if in.FirstName == "" || in.Email == "" || in.Password == "" {
-		c.JSON(400, gin.H{"error": "firstName, email and password are required"})
+	if in.FirstName == "" || len([]rune(in.FirstName)) > 80 || len([]rune(in.LastName)) > 80 || !validateEmail(in.Email) || in.Password == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "valid name, email, and password are required"})
 		return
 	}
-	if len(in.Password) < 6 {
-		c.JSON(400, gin.H{"error": "password must be at least 6 characters"})
+	if len(in.Password) < 10 || len(in.Password) > 200 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "password must be between 10 and 200 characters"})
 		return
 	}
 
-	emailKey := sanitizeKey(in.Email)
-	emailRef := rtdb.NewRef("users_by_email/" + emailKey)
+	registrationMu.Lock()
+	defer registrationMu.Unlock()
+	dbCtx, cancel := withDBTimeout()
+	defer cancel()
 
+	emailRef := rtdb.NewRef("users_by_email/" + emailIndexKey(in.Email))
 	var existingUID string
-	if err := emailRef.Get(ctx, &existingUID); err == nil && existingUID != "" {
-		c.JSON(409, gin.H{"error": "email already registered"})
+	if err := emailRef.Get(dbCtx, &existingUID); err != nil {
+		dbUnreachableJSON(c, "check existing email", err)
+		return
+	}
+	if existingUID != "" {
+		c.JSON(http.StatusConflict, gin.H{"error": "email already registered"})
 		return
 	}
 
-	pw, err := bcrypt.GenerateFromPassword([]byte(in.Password), 10)
+	pw, err := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
 	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to hash password"})
+		log.Printf("[REGISTER] password hash error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
 		return
 	}
-
-	usersRef := rtdb.NewRef("users")
-	newRef, err := usersRef.Push(ctx, nil)
+	newRef, err := rtdb.NewRef("users").Push(dbCtx, nil)
 	if err != nil {
-		log.Printf("[REGISTER] create user key error: %v", err)
-		c.JSON(500, gin.H{"error": "failed to create user"})
+		dbUnreachableJSON(c, "create user key", err)
 		return
 	}
-
-	user := User{
-		ID:       newRef.Key,
-		Name:     strings.TrimSpace(in.FirstName + " " + in.LastName),
-		Email:    in.Email,
-		Password: string(pw),
-		Role:     "user",
-	}
-	if err := newRef.Set(ctx, user); err != nil {
-		log.Printf("[REGISTER] write user error: %v", err)
-		c.JSON(500, gin.H{"error": "failed to create user"})
+	user := User{ID: newRef.Key, Name: strings.TrimSpace(in.FirstName + " " + in.LastName), Email: in.Email, Password: string(pw), Role: "user"}
+	if err := newRef.Set(dbCtx, user); err != nil {
+		dbUnreachableJSON(c, "write user", err)
 		return
 	}
-	if err := emailRef.Set(ctx, newRef.Key); err != nil {
-		log.Printf("[REGISTER] write email index error: %v", err)
-		c.JSON(500, gin.H{"error": "failed to create user"})
+	if err := emailRef.Set(dbCtx, newRef.Key); err != nil {
+		dbUnreachableJSON(c, "write email index", err)
 		return
 	}
-
-	c.JSON(200, gin.H{"message": "success"})
+	c.JSON(http.StatusCreated, gin.H{"message": "success"})
 }
 
 func login(c *gin.Context) {
@@ -1045,42 +1374,68 @@ func login(c *gin.Context) {
 		Password string `json:"password"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
-		c.JSON(400, gin.H{"error": "invalid request body"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	in.Email = strings.TrimSpace(strings.ToLower(in.Email))
+	if !validateEmail(in.Email) || in.Password == "" || len(in.Password) > 200 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid email or password"})
 		return
 	}
 
-	emailKey := sanitizeKey(strings.TrimSpace(strings.ToLower(in.Email)))
+	dbCtx, cancel := withDBTimeout()
+	defer cancel()
 
 	var uid string
-	if err := rtdb.NewRef("users_by_email/"+emailKey).Get(ctx, &uid); err != nil || uid == "" {
-		c.JSON(401, gin.H{"error": "invalid email or password"})
+	if err := rtdb.NewRef("users_by_email/"+emailIndexKey(in.Email)).Get(dbCtx, &uid); err != nil {
+		dbUnreachableJSON(c, "lookup email index", err)
+		return
+	}
+	if uid == "" {
+		// Backward-compatible lookup for accounts created before the encoded index.
+		if err := rtdb.NewRef("users_by_email/"+sanitizeKey(in.Email)).Get(dbCtx, &uid); err != nil {
+			dbUnreachableJSON(c, "lookup legacy email index", err)
+			return
+		}
+	}
+	if uid == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid email or password"})
 		return
 	}
 
 	var u User
-	if err := rtdb.NewRef("users/"+uid).Get(ctx, &u); err == nil && u.Password != "" {
-		if err := bcrypt.CompareHashAndPassword([]byte(u.Password), []byte(in.Password)); err == nil {
-			role := u.Role
-			if role == "" {
-				role = "user"
-			}
-			token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-				"user_id": u.ID,
-				"role":    role,
-				"exp":     time.Now().Add(24 * time.Hour).Unix(),
-			})
-			t, signErr := token.SignedString(jwtSecret)
-			if signErr != nil {
-				c.JSON(500, gin.H{"error": "failed to issue token"})
-				return
-			}
-			resp := u.sanitizedForClient()
-			resp.Role = role
-			c.JSON(200, gin.H{"token": t, "user": resp})
-			return
-		}
+	if err := rtdb.NewRef("users/"+uid).Get(dbCtx, &u); err != nil {
+		dbUnreachableJSON(c, "fetch user", err)
+		return
 	}
-	c.JSON(401, gin.H{"error": "invalid email or password"})
-}
+	if u.Password == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid email or password"})
+		return
+	}
 
-var _ = nowBST
+	if err := bcrypt.CompareHashAndPassword([]byte(u.Password), []byte(in.Password)); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid email or password"})
+		return
+	}
+
+	role := u.Role
+	if role == "" {
+		role = "user"
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": u.ID,
+		"role":    role,
+		"iat":     time.Now().Unix(),
+		"exp":     time.Now().Add(12 * time.Hour).Unix(),
+	})
+	t, signErr := token.SignedString(jwtSecret)
+	if signErr != nil {
+		log.Printf("[LOGIN] token sign error: %v", signErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to issue token"})
+		return
+	}
+
+	resp := u.sanitizedForClient()
+	resp.Role = role
+	c.JSON(200, gin.H{"token": t, "user": resp})
+}

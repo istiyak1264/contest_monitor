@@ -1,8 +1,2 @@
-# Firebase service account key
-backend/firebase_credentials.json
-
-# Environment files with secrets
 .env
-
-# Go build artifacts
-backend/main
+secrets/

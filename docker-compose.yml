@@ -1,25 +1,53 @@
 services:
   backend:
-    build: ./backend
-    restart: always
+    build:
+      context: ./backend
+    restart: unless-stopped
     network_mode: host
+    init: true
     environment:
-      FIREBASE_DATABASE_URL: ${FIREBASE_DATABASE_URL}
-      FIREBASE_CREDENTIALS_FILE: /app/firebase_credentials.json
-      JWT_SECRET: ${JWT_SECRET}
+      FIREBASE_DATABASE_URL: ${FIREBASE_DATABASE_URL:?Set FIREBASE_DATABASE_URL in .env}
+      # This is the path inside the container, not the host path.
+      FIREBASE_CREDENTIALS_FILE: /run/secrets/firebase_credentials
+      JWT_SECRET: ${JWT_SECRET:?Set a random JWT_SECRET of at least 32 characters in .env}
       GIN_MODE: ${GIN_MODE:-release}
       PORT: ${PORT:-8081}
+      CAPTURE_ENABLED: ${CAPTURE_ENABLED:-false}
       SNIFF_IFACE: ${SNIFF_IFACE:-}
-    volumes:
-      - ./backend/firebase_credentials.json:/app/firebase_credentials.json:ro
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://192.168.10.192:3000}
+    secrets:
+      - firebase_credentials
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8081/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   frontend:
     build:
       context: ./frontend
       args:
-        VITE_API_URL: ${VITE_API_URL:-http://localhost:8081}
-    restart: always
+        VITE_API_URL: ${VITE_API_URL:-/api}
+    restart: unless-stopped
+    init: true
     ports:
       - "3000:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+secrets:
+  firebase_credentials:
+    # This is the path on the host running Docker Compose.
+    file: ${FIREBASE_CREDENTIALS_FILE:-./secrets/firebase-credentials.json}
